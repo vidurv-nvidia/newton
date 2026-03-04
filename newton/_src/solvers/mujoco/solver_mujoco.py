@@ -2127,51 +2127,7 @@ class SolverMuJoCo(SolverBase):
                     self.mujoco_warp_step()
                 else:
                     self.convert_contacts_to_mjwarp(self.model, state_in, contacts)
-
-                    if self._step < 2:
-                        wp.synchronize()
-                        d = self.mjw_data
-                        m = self.mjw_model
-                        print(f"\n{'='*80}")
-                        print(f"[SOLVER DEBUG] step={self._step} BEFORE mujoco_warp_step")
-                        print(f"{'='*80}")
-                        print(f"  qpos FULL: {d.qpos.numpy().flatten()}")
-                        print(f"  qvel FULL: {d.qvel.numpy().flatten()}")
-                        print(f"  nacon: {d.nacon.numpy()}")
-                        nacon_val = d.nacon.numpy().flatten()[0]
-                        print(f"  contact.type[:{nacon_val}]: {d.contact.type.numpy().flatten()[:nacon_val]}")
-                        print(f"  contact.dist[:{nacon_val}]: {d.contact.dist.numpy().flatten()[:nacon_val]}")
-                        print(f"  contact.geom[:{nacon_val}]: {d.contact.geom.numpy()[:nacon_val]}")
-                        print(f"  contact.worldid[:{nacon_val}]: {d.contact.worldid.numpy().flatten()[:nacon_val]}")
-                        print(f"  solver={m.opt.solver} integrator={m.opt.integrator} cone={m.opt.cone}")
-                        print(f"  iterations={m.opt.iterations} timestep={m.opt.timestep.numpy()}")
-                        print(f"  gravity={m.opt.gravity.numpy()} disableflags={m.opt.disableflags}")
-
                     self.mujoco_warp_step()
-
-                    if self._step < 2:
-                        wp.synchronize()
-                        d = self.mjw_data
-                        print(f"\n--- AFTER mujoco_warp_step ---")
-                        print(f"  qpos FULL: {d.qpos.numpy().flatten()}")
-                        print(f"  qvel FULL: {d.qvel.numpy().flatten()}")
-                        print(f"  qacc FULL: {d.qacc.numpy().flatten()}")
-                        print(f"  qfrc_bias FULL: {d.qfrc_bias.numpy().flatten()}")
-                        for attr in ['qfrc_constraint', 'qfrc_passive', 'qfrc_applied', 'qfrc_actuator', 'qfrc_smooth', 'qfrc_inverse']:
-                            if hasattr(d, attr):
-                                val = getattr(d, attr)
-                                if val is not None:
-                                    arr = val.numpy().flatten()
-                                    if any(arr != 0):
-                                        print(f"  {attr} FULL: {arr}")
-                        print(f"  nefc={d.nefc.numpy()} ne={d.ne.numpy()} nf={d.nf.numpy()} nl={d.nl.numpy()}")
-                        nefc_val = d.nefc.numpy().flatten()[0]
-                        if nefc_val > 0 and hasattr(d.efc, 'force'):
-                            print(f"  efc.force[:{nefc_val}]: {d.efc.force.numpy().flatten()[:nefc_val]}")
-                            print(f"  efc.type[:{nefc_val}]: {d.efc.type.numpy().flatten()[:nefc_val]}")
-                        if hasattr(d, 'solver_niter'):
-                            print(f"  solver_niter: {d.solver_niter.numpy()}")
-                        print(f"{'='*80}\n")
 
             self.update_newton_state(self.model, state_out, self.mjw_data)
         self._step += 1
@@ -3835,22 +3791,6 @@ class SolverMuJoCo(SolverBase):
             mjc_eq_to_newton_mimic_dict[eq.id] = i
 
         if skip_visual_only_geoms and len(spec.geoms) != colliding_shapes_per_world:
-            print(f"[DEBUG GEOM MISMATCH] spec.geoms={len(spec.geoms)}, colliding_shapes_per_world={colliding_shapes_per_world}")
-            print(f"[DEBUG] selected_shapes={len(selected_shapes)}, selected_bodies={len(selected_bodies)}")
-            print(f"[DEBUG] separate_worlds={separate_worlds}, world_count={model.world_count}")
-            shape_body_np = model.shape_body.numpy() if hasattr(model.shape_body, 'numpy') else np.array(model.shape_body)
-            mjc_geom_names = set(g.name for g in spec.geoms)
-            print(f"[DEBUG] --- colliding shapes ---")
-            for s in colliding_shapes[:60]:
-                body_id = int(shape_body_np[s])
-                bkey = model.body_key[body_id] if body_id >= 0 else "world"
-                skey = model.shape_key[s]
-                in_mjc = f"{skey}_{s}" in mjc_geom_names
-                in_body_map = body_id in body_mapping
-                print(f"[DEBUG]   shape {s}: key={skey}, body={bkey}(id={body_id}), in_mjc={in_mjc}, in_body_map={in_body_map}")
-            print(f"[DEBUG] --- MJC geoms ({len(spec.geoms)}) ---")
-            for g in spec.geoms[:60]:
-                print(f"[DEBUG]   geom: {g.name}")
             raise ValueError(
                 "The number of geoms in the MuJoCo model does not match the number of colliding shapes in the Newton model."
             )
