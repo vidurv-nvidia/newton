@@ -335,7 +335,9 @@ class IKSolver:
         joint_q_out: wp.array2d[wp.float32],
         iterations: int = 50,
         step_size: float = 1.0,
-    ) -> None:
+        tol: float | None = None,
+        check_every: int = 5,
+    ) -> int:
         """Solve all base problems and write the best result for each one.
 
         Args:
@@ -344,9 +346,18 @@ class IKSolver:
             joint_q_out: Output joint coordinates [m or rad] for the selected
                 solution of each base problem, shape [n_problems, joint_coord_count].
                 It may alias ``joint_q_in``.
-            iterations: Number of optimizer iterations to run for each sampled
-                seed.
+            iterations: Maximum number of optimizer iterations to run for each
+                sampled seed.
             step_size: Unitless LM step scale. Ignored by the L-BFGS backend.
+            tol: Optional cost tolerance for early termination. When set, the
+                optimizer stops as soon as the maximum cost across all expanded
+                batch rows drops below this value. Defaults to ``None``
+                (run all *iterations*).
+            check_every: How often (in iterations) to evaluate the early
+                termination criterion. Only used when *tol* is not ``None``.
+
+        Returns:
+            Number of iterations actually executed.
         """
         if joint_q_in.shape != (self.n_problems, self.n_coords):
             raise ValueError("joint_q_in has incompatible shape")
@@ -358,9 +369,17 @@ class IKSolver:
         self._impl.reset()
 
         if self.optimizer_type is IKOptimizer.LM:
-            self._impl.step(self.joint_q_expanded, self.joint_q_expanded, iterations=iterations, step_size=step_size)
+            iters_used = self._impl.step(
+                self.joint_q_expanded, self.joint_q_expanded,
+                iterations=iterations, step_size=step_size,
+                tol=tol, check_every=check_every,
+            )
         elif self.optimizer_type is IKOptimizer.LBFGS:
-            self._impl.step(self.joint_q_expanded, self.joint_q_expanded, iterations=iterations)
+            iters_used = self._impl.step(
+                self.joint_q_expanded, self.joint_q_expanded,
+                iterations=iterations,
+                tol=tol, check_every=check_every,
+            )
         else:
             raise RuntimeError(f"Unsupported optimizer: {self.optimizer_type}")
 
@@ -369,7 +388,7 @@ class IKSolver:
         if self.n_seeds == 1:
             if joint_q_out.ptr != self.joint_q_expanded.ptr:
                 wp.copy(joint_q_out, self.joint_q_expanded)
-            return
+            return iters_used
 
         wp.launch(
             _select_best_seed_indices,
@@ -385,6 +404,7 @@ class IKSolver:
             outputs=[joint_q_out],
             device=self.device,
         )
+        return iters_used
 
     def reset(self) -> None:
         """Reset optimizer state, selected seeds, and the sampler RNG."""

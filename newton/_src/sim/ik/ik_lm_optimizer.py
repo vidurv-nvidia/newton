@@ -451,7 +451,9 @@ class IKOptimizerLM:
         joint_q_out: wp.array2d[wp.float32],
         iterations: int = 10,
         step_size: float = 1.0,
-    ) -> None:
+        tol: float | None = None,
+        check_every: int = 5,
+    ) -> int:
         """Run several LM iterations on a batch of joint configurations.
 
         Args:
@@ -459,9 +461,17 @@ class IKOptimizerLM:
             joint_q_out: Output buffer for the optimized coordinates, shape
                 [n_batch, joint_coord_count]. It may alias ``joint_q_in`` for
                 in-place updates.
-            iterations: Number of LM iterations to execute.
+            iterations: Maximum number of LM iterations to execute.
             step_size: Scalar applied to each computed update before
                 integration.
+            tol: Optional cost tolerance for early termination. When set, the
+                solver stops as soon as the maximum cost across all batch rows
+                drops below this value.
+            check_every: How often (in iterations) to evaluate the early
+                termination criterion. Only used when *tol* is not None.
+
+        Returns:
+            Number of iterations actually executed.
         """
         if joint_q_in.shape != (self.n_batch, self.n_coords):
             raise ValueError("joint_q_in has incompatible shape")
@@ -474,8 +484,14 @@ class IKOptimizerLM:
         joint_q = joint_q_out
 
         self.lambda_values.fill_(self.lambda_initial)
+        iters_used = iterations
         for i in range(iterations):
             self._step(joint_q, step_size=step_size, iteration=i)
+            if tol is not None and (i + 1) % check_every == 0:
+                if float(np.max(self.costs.numpy())) < tol:
+                    iters_used = i + 1
+                    break
+        return iters_used
 
     def _compute_residuals(
         self,

@@ -770,7 +770,9 @@ class IKOptimizerLBFGS:
         joint_q_in: wp.array2d[wp.float32],
         joint_q_out: wp.array2d[wp.float32],
         iterations: int = 50,
-    ) -> None:
+        tol: float | None = None,
+        check_every: int = 5,
+    ) -> int:
         """Run several L-BFGS iterations on a batch of joint configurations.
 
         Args:
@@ -778,7 +780,15 @@ class IKOptimizerLBFGS:
             joint_q_out: Output buffer for the optimized coordinates, shape
                 [n_batch, joint_coord_count]. It may alias ``joint_q_in`` for
                 in-place updates.
-            iterations: Number of L-BFGS iterations to execute.
+            iterations: Maximum number of L-BFGS iterations to execute.
+            tol: Optional cost tolerance for early termination. When set, the
+                solver stops as soon as the maximum cost across all batch rows
+                drops below this value.
+            check_every: How often (in iterations) to evaluate the early
+                termination criterion. Only used when *tol* is not None.
+
+        Returns:
+            Number of iterations actually executed.
         """
         if joint_q_in.shape != (self.n_batch, self.n_coords):
             raise ValueError("joint_q_in has incompatible shape")
@@ -790,8 +800,15 @@ class IKOptimizerLBFGS:
 
         joint_q = joint_q_out
 
+        iters_used = iterations
         for i in range(iterations):
             self._step(joint_q, iteration=i)
+            if tol is not None and (i + 1) % check_every == 0:
+                self.compute_costs(joint_q)
+                if float(np.max(self.costs.numpy())) < tol:
+                    iters_used = i + 1
+                    break
+        return iters_used
 
     def reset(self) -> None:
         """Clear L-BFGS history and cached line-search state."""
