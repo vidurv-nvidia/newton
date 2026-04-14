@@ -736,7 +736,7 @@ class IKOptimizerQP:
                     break
 
             # Write back warm-start state and solution
-            wp.tile_store(dq_out[row], dq)
+            wp.tile_store(dq_out[row], z_cur)
             for i in range(DOF):
                 z_io[row, i] = z_cur[i]
                 u_io[row, i] = u_cur[i]
