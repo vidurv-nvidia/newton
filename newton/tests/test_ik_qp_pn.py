@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 The Newton Developers
 # SPDX-License-Identifier: Apache-2.0
 
-"""Tests for the projected gradient descent QP inverse-kinematics optimizer."""
+"""Tests for the projected-Newton QP inverse-kinematics optimizer."""
 
 from __future__ import annotations
 
@@ -91,16 +91,18 @@ def _run_fk(model, joint_q_2d, n_problems):
 
 
 # ----------------------------------------------------------------------------
-# 1. test_qp_pgd_converges_position
+# 1. test_qp_pn_converges_position
 # ----------------------------------------------------------------------------
 
 
-def test_qp_pgd_converges_position(test, device):
+def test_qp_pn_converges_position(test, device):
     with wp.ScopedDevice(device):
         n_problems = 3
         model = _build_two_link_planar(device)
 
-        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
+        joint_q_2d = wp.zeros(
+            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
+        )
         targets = wp.array([[1.5, 1.0, 0.0]] * n_problems, dtype=wp.vec3)
         ee_link = 1
         ee_off = wp.vec3(0.5, 0.0, 0.0)
@@ -115,34 +117,35 @@ def test_qp_pgd_converges_position(test, device):
             model,
             n_problems,
             [pos_obj],
-            optimizer=ik.IKOptimizer.QP_PGD,
+            optimizer=ik.IKOptimizer.QP_PN,
             jacobian_mode=ik.IKJacobianType.AUTODIFF,
             qp_damping=1e-4,
-            qp_pgd_max_iters=50,
+            qp_pn_max_iters=10,
         )
 
-        # PGD is slower than ADMM so we give it more outer iterations
-        solver.step(joint_q_2d, joint_q_2d, iterations=120, step_size=1.0)
+        solver.step(joint_q_2d, joint_q_2d, iterations=80, step_size=1.0)
 
         body_q, _ = _run_fk(model, joint_q_2d, n_problems)
         final = _fk_end_effector_positions(model, body_q, n_problems, ee_link, ee_off)
 
         for prob in range(n_problems):
             err = np.linalg.norm(final[prob] - targets.numpy()[prob])
-            test.assertLess(err, 5e-3, f"problem {prob} position error {err:.6f} > 5mm")
+            test.assertLess(err, 1e-3, f"problem {prob} position error {err:.6f} > 1mm")
 
 
 # ----------------------------------------------------------------------------
-# 2. test_qp_pgd_respects_joint_limits
+# 2. test_qp_pn_respects_joint_limits
 # ----------------------------------------------------------------------------
 
 
-def test_qp_pgd_respects_joint_limits(test, device):
+def test_qp_pn_respects_joint_limits(test, device):
     with wp.ScopedDevice(device):
         n_problems = 2
         model = _build_two_link_planar(device)
 
-        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
+        joint_q_2d = wp.zeros(
+            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
+        )
 
         # Target that requires large joint angles - push toward limits
         targets = wp.array([[0.0, 1.8, 0.0]] * n_problems, dtype=wp.vec3)
@@ -159,13 +162,12 @@ def test_qp_pgd_respects_joint_limits(test, device):
             model,
             n_problems,
             [pos_obj],
-            optimizer=ik.IKOptimizer.QP_PGD,
+            optimizer=ik.IKOptimizer.QP_PN,
             jacobian_mode=ik.IKJacobianType.AUTODIFF,
             qp_damping=1e-4,
-            qp_pgd_max_iters=50,
         )
 
-        solver.step(joint_q_2d, joint_q_2d, iterations=80, step_size=1.0)
+        solver.step(joint_q_2d, joint_q_2d, iterations=50, step_size=1.0)
 
         q_np = joint_q_2d.numpy()
         lower = model.joint_limit_lower.numpy()[: model.joint_coord_count]
@@ -189,16 +191,18 @@ def test_qp_pgd_respects_joint_limits(test, device):
 
 
 # ----------------------------------------------------------------------------
-# 3. test_qp_pgd_batch
+# 3. test_qp_pn_batch
 # ----------------------------------------------------------------------------
 
 
-def test_qp_pgd_batch(test, device):
+def test_qp_pn_batch(test, device):
     with wp.ScopedDevice(device):
         n_problems = 5
         model = _build_two_link_planar(device)
 
-        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
+        joint_q_2d = wp.zeros(
+            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
+        )
 
         # Different targets for each problem
         target_data = [
@@ -222,13 +226,12 @@ def test_qp_pgd_batch(test, device):
             model,
             n_problems,
             [pos_obj],
-            optimizer=ik.IKOptimizer.QP_PGD,
+            optimizer=ik.IKOptimizer.QP_PN,
             jacobian_mode=ik.IKJacobianType.AUTODIFF,
             qp_damping=1e-4,
-            qp_pgd_max_iters=50,
         )
 
-        solver.step(joint_q_2d, joint_q_2d, iterations=120, step_size=1.0)
+        solver.step(joint_q_2d, joint_q_2d, iterations=80, step_size=1.0)
 
         body_q, _ = _run_fk(model, joint_q_2d, n_problems)
         final = _fk_end_effector_positions(model, body_q, n_problems, ee_link, ee_off)
@@ -245,13 +248,13 @@ def test_qp_pgd_batch(test, device):
 devices = get_test_devices()
 
 
-class TestIKQPPGD(unittest.TestCase):
+class TestIKQPPN(unittest.TestCase):
     pass
 
 
-add_function_test(TestIKQPPGD, "test_qp_pgd_converges_position", test_qp_pgd_converges_position, devices)
-add_function_test(TestIKQPPGD, "test_qp_pgd_respects_joint_limits", test_qp_pgd_respects_joint_limits, devices)
-add_function_test(TestIKQPPGD, "test_qp_pgd_batch", test_qp_pgd_batch, devices)
+add_function_test(TestIKQPPN, "test_qp_pn_converges_position", test_qp_pn_converges_position, devices)
+add_function_test(TestIKQPPN, "test_qp_pn_respects_joint_limits", test_qp_pn_respects_joint_limits, devices)
+add_function_test(TestIKQPPN, "test_qp_pn_batch", test_qp_pn_batch, devices)
 
 
 if __name__ == "__main__":
