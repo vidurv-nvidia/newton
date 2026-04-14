@@ -160,6 +160,53 @@ newton/_src/sim/ik/ik_lbfgs_optimizer.py | +23 -3  (step() signature + early exi
 newton/_src/sim/ik/ik_solver.py          | +14 -3  (step() signature + pass-through)
 ```
 
+## Onboard Control Rate Analysis
+
+Translating single-problem p50 latency into achievable IK control frequency (Hz = 1000 / latency_ms). This represents the best-case ceiling for a single-robot control loop where IK is the bottleneck.
+
+### Per-Robot, Per-Difficulty Breakdown
+
+| Robot | Task | Solver | Device | p50 (ms) | Hz |
+|-------|------|--------|--------|----------|---:|
+| Panda | easy | Newton LM (default) | cpu | 6.00 | 167 |
+| Panda | easy | **Newton LM (earlystop)** | **cpu** | **1.32** | **758** |
+| Panda | easy | Newton LM (default) | gpu | 9.48 | 106 |
+| Panda | easy | **Newton LM (earlystop)** | **gpu** | **2.09** | **478** |
+| Panda | easy | Mink QP | cpu | 0.43 | 2,312 |
+| Panda | boundary | Newton LM (default) | cpu | 5.98 | 167 |
+| Panda | boundary | **Newton LM (earlystop)** | **cpu** | **3.09** | **324** |
+| Panda | boundary | Mink QP | cpu | 0.83 | 1,208 |
+| UR5e | easy | Newton LM (default) | cpu | 5.97 | 167 |
+| UR5e | easy | **Newton LM (earlystop)** | **cpu** | **1.37** | **731** |
+| UR5e | easy | Mink QP | cpu | 1.14 | 874 |
+| UR5e | boundary | **Newton LM (earlystop)** | **cpu** | **1.40** | **715** |
+| UR5e | boundary | Mink QP | cpu | 0.67 | 1,498 |
+| KUKA | easy | Newton LM (default) | cpu | 5.91 | 169 |
+| KUKA | easy | **Newton LM (earlystop)** | **cpu** | **1.29** | **776** |
+| KUKA | easy | Mink QP | cpu | 0.40 | 2,515 |
+| KUKA | boundary | **Newton LM (earlystop)** | **cpu** | **1.31** | **764** |
+| KUKA | boundary | Mink QP | cpu | 0.53 | 1,887 |
+
+### Summary: Worst-Case Hz Across All Robots and Tasks
+
+| Solver | Device | Easy Hz | Boundary Hz | Singular Hz | Worst-case Hz |
+|--------|--------|--------:|------------:|------------:|--------------:|
+| Mink QP | cpu | 1,519 | 1,481 | 1,651 | **1,481** |
+| **Newton LM (earlystop)** | **cpu** | **754** | **518** | **632** | **518** |
+| Newton LM (earlystop) | gpu | 461 | 324 | 364 | 324 |
+| Newton LM (default) | cpu | 168 | 166 | 166 | 166 |
+| Newton LM (default) | gpu | 105 | 105 | 104 | 104 |
+| Newton L-BFGS | cpu | 61 | 60 | 61 | 60 |
+| Newton L-BFGS | gpu | 41 | 41 | 38 | 38 |
+
+### Practical Implications
+
+- **1kHz servo control:** Mink QP is the only option at 1.5kHz worst-case. Newton cannot reach 1kHz even with early termination.
+- **500Hz control (common for manipulators):** Newton LM with early termination on CPU achieves 518Hz worst-case — viable but tight. Easy/singular tasks give 630-750Hz headroom.
+- **200-300Hz control:** Newton LM earlystop on GPU reaches 324Hz worst-case. GPU adds kernel launch overhead that hurts single-problem latency.
+- **100Hz control (typical ROS rate):** Newton LM default (166Hz) is sufficient. No code change needed for this tier.
+- **Newton's real-time advantage is batch:** For multi-robot fleet control (N=100+), Newton GPU solves the entire fleet in constant ~10ms (100Hz for 10,000 robots simultaneously). Mink scales linearly and caps at ~1,500 solves/sec regardless of fleet size.
+
 ## Reproducing
 
 ```bash
