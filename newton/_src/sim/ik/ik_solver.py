@@ -17,6 +17,7 @@ from .ik_common import IKJacobianType
 from .ik_lbfgs_optimizer import IKOptimizerLBFGS
 from .ik_lm_optimizer import IKOptimizerLM
 from .ik_objectives import IKObjective
+from .ik_qp_optimizer import IKOptimizerQP
 
 
 class IKOptimizer(str, Enum):
@@ -27,6 +28,9 @@ class IKOptimizer(str, Enum):
 
     LBFGS = "lbfgs"
     """Use an L-BFGS quasi-Newton optimizer."""
+
+    QP = "qp"
+    """Use an ADMM-based QP optimizer for differential IK."""
 
 
 class IKSampler(str, Enum):
@@ -248,6 +252,13 @@ class IKSolver:
         line_search_alphas: Sequence[float] | None = None,
         wolfe_c1: float = 1e-4,
         wolfe_c2: float = 0.9,
+        # QP parameters
+        qp_max_iters: int = 20,
+        qp_rho: float = 1.0,
+        qp_tol: float = 1e-6,
+        qp_damping: float = 1e-4,
+        qp_dt: float = 0.01,
+        qp_velocity_limit: np.ndarray | None = None,
     ) -> None:
         if isinstance(optimizer, str):
             optimizer = IKOptimizer(optimizer)
@@ -324,6 +335,20 @@ class IKSolver:
                 wolfe_c1=wolfe_c1,
                 wolfe_c2=wolfe_c2,
             )
+        elif optimizer is IKOptimizer.QP:
+            self._impl = IKOptimizerQP(
+                model,
+                self.n_expanded,
+                objectives,
+                problem_idx=self.problem_idx_expanded,
+                jacobian_mode=jacobian_mode,
+                qp_max_iters=qp_max_iters,
+                qp_rho=qp_rho,
+                qp_tol=qp_tol,
+                damping=qp_damping,
+                dt=qp_dt,
+                velocity_limit=qp_velocity_limit,
+            )
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer}")
 
@@ -361,6 +386,8 @@ class IKSolver:
             self._impl.step(self.joint_q_expanded, self.joint_q_expanded, iterations=iterations, step_size=step_size)
         elif self.optimizer_type is IKOptimizer.LBFGS:
             self._impl.step(self.joint_q_expanded, self.joint_q_expanded, iterations=iterations)
+        elif self.optimizer_type is IKOptimizer.QP:
+            self._impl.step(self.joint_q_expanded, self.joint_q_expanded, iterations=iterations, step_size=step_size)
         else:
             raise RuntimeError(f"Unsupported optimizer: {self.optimizer_type}")
 

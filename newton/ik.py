@@ -12,6 +12,7 @@ from ._src.sim.ik import (
     IKOptimizer,
     IKOptimizerLBFGS,
     IKOptimizerLM,
+    IKOptimizerQP,
     IKSampler,
     IKSolver,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "IKOptimizer",
     "IKOptimizerLBFGS",
     "IKOptimizerLM",
+    "IKOptimizerQP",
     "IKSampler",
     "IKSolver",
 ]
