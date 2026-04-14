@@ -53,6 +53,26 @@ class BatchCtx:
 
 
 @wp.kernel
+def _clamp_joints_to_limits(
+    joint_q: wp.array2d[wp.float32],
+    joint_limit_lower: wp.array[wp.float32],
+    joint_limit_upper: wp.array[wp.float32],
+    n_dofs: int,
+):
+    """Clamp joint coordinates to valid bounds in-place."""
+    row = wp.tid()
+    for i in range(n_dofs):
+        lo = joint_limit_lower[i]
+        hi = joint_limit_upper[i]
+        span = hi - lo
+        if span > 0.0 and span < 1.0e5:
+            q_i = joint_q[row, i]
+            q_i = wp.max(q_i, lo)
+            q_i = wp.min(q_i, hi)
+            joint_q[row, i] = q_i
+
+
+@wp.kernel
 def _compute_box_bounds(
     joint_q: wp.array2d[wp.float32],
     joint_limit_lower: wp.array[wp.float32],
@@ -524,6 +544,14 @@ class IKOptimizerQPProjectedNewton:
 
         joint_q = joint_q_out
 
+        # Clamp input to valid joint bounds — prevents infeasible starting configs
+        wp.launch(
+            _clamp_joints_to_limits,
+            dim=self.n_batch,
+            inputs=[joint_q, self.model.joint_limit_lower, self.model.joint_limit_upper, self.n_dofs],
+            device=self.device,
+        )
+
         for _ in range(iterations):
             self._step(joint_q, step_size=step_size)
 
@@ -657,14 +685,14 @@ class IKOptimizerQPProjectedNewton:
                 damping_diag[i] = damping
             H = wp.tile_diag_add(JtJ, damping_diag)
 
-            # Precompute c = J^T r (linear term of QP: min 1/2 x^T H x + c^T x)
-            # The residual r encodes signed error and J = d(residual)/d(dq),
-            # so the linearized cost is ||r + J dq||^2, giving c = J^T r.
+            # Precompute c = -J^T r (linear term of QP: min 1/2 x^T H x + c^T x)
+            # The gradient of 1/2 ||r + J dq||^2 is J^T(r + J dq), so at dq=0
+            # the gradient is J^T r. The unconstrained min is H dq = -J^T r.
             Jtr_2d = wp.tile_zeros(shape=(DOF, 1), dtype=wp.float32)
             wp.tile_matmul(Jt, r, Jtr_2d)
             c = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
             for i in range(DOF):
-                c[i] = Jtr_2d[i, 0]
+                c[i] = -Jtr_2d[i, 0]
 
             # Load box bounds
             lb_vec = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
