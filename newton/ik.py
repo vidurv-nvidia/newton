@@ -13,6 +13,8 @@ from ._src.sim.ik import (
     IKOptimizerLBFGS,
     IKOptimizerLM,
     IKOptimizerQP,
+    IKOptimizerQPPGD,
+    IKOptimizerQPProjectedNewton,
     IKSampler,
     IKSolver,
 )
@@ -27,6 +29,8 @@ __all__ = [
     "IKOptimizerLBFGS",
     "IKOptimizerLM",
     "IKOptimizerQP",
+    "IKOptimizerQPPGD",
+    "IKOptimizerQPProjectedNewton",
     "IKSampler",
     "IKSolver",
 ]

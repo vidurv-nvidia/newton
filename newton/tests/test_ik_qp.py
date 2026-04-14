@@ -137,9 +137,7 @@ def test_qp_converges_position(test, device):
         n_problems = 3
         model = _build_two_link_planar(device)
 
-        joint_q_2d = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
         targets = wp.array([[1.5, 1.0, 0.0]] * n_problems, dtype=wp.vec3)
         ee_link = 1
         ee_off = wp.vec3(0.5, 0.0, 0.0)
@@ -181,9 +179,7 @@ def test_qp_converges_rotation(test, device):
         n_problems = 3
         model = _build_single_d6(device)
 
-        joint_q_2d = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
 
         angles = [math.pi / 6 + prob * math.pi / 8 for prob in range(n_problems)]
         rot_targets = wp.array(
@@ -236,9 +232,7 @@ def test_qp_joint_limits_respected(test, device):
         n_problems = 2
         model = _build_two_link_planar(device)
 
-        joint_q_2d = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
 
         # Target that requires large joint angles - push toward limits
         targets = wp.array([[0.0, 1.8, 0.0]] * n_problems, dtype=wp.vec3)
@@ -296,9 +290,7 @@ def test_qp_velocity_limits_respected(test, device):
         dt = 0.02
         v_max = 1.0  # rad/s per DOF
 
-        joint_q_2d = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
         q_before = joint_q_2d.numpy().copy()
 
         targets = wp.array([[1.5, 1.0, 0.0]] * n_problems, dtype=wp.vec3)
@@ -361,9 +353,7 @@ def test_qp_warm_start_faster(test, device):
         )
 
         # Cold start: reset before each outer iteration batch
-        joint_q_cold = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_cold = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
         solver_cold = ik.IKSolver(
             model,
             n_problems,
@@ -381,9 +371,7 @@ def test_qp_warm_start_faster(test, device):
 
         # Warm start: same problem but with solver that persists ADMM state
         # Run in two phases to demonstrate warm-start benefit
-        joint_q_warm = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_warm = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
 
         pos_obj_warm = ik.IKObjectivePosition(
             link_index=ee_link,
@@ -428,19 +416,13 @@ def test_qp_matches_lm_accuracy(test, device):
         n_problems = 3
         model = _build_two_link_planar(device)
 
-        targets = wp.array(
-            [[1.5, 1.0, 0.0], [1.0, 1.5, 0.0], [0.5, 1.8, 0.0]], dtype=wp.vec3
-        )
+        targets = wp.array([[1.5, 1.0, 0.0], [1.0, 1.5, 0.0], [0.5, 1.8, 0.0]], dtype=wp.vec3)
         ee_link = 1
         ee_off = wp.vec3(0.5, 0.0, 0.0)
 
         # LM solve
-        pos_obj_lm = ik.IKObjectivePosition(
-            link_index=ee_link, link_offset=ee_off, target_positions=targets
-        )
-        joint_q_lm = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        pos_obj_lm = ik.IKObjectivePosition(link_index=ee_link, link_offset=ee_off, target_positions=targets)
+        joint_q_lm = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
         solver_lm = ik.IKSolver(
             model,
             n_problems,
@@ -455,12 +437,8 @@ def test_qp_matches_lm_accuracy(test, device):
         pos_lm = _fk_end_effector_positions(model, body_q_lm, n_problems, ee_link, ee_off)
 
         # QP solve
-        pos_obj_qp = ik.IKObjectivePosition(
-            link_index=ee_link, link_offset=ee_off, target_positions=targets
-        )
-        joint_q_qp = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        pos_obj_qp = ik.IKObjectivePosition(link_index=ee_link, link_offset=ee_off, target_positions=targets)
+        joint_q_qp = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
         solver_qp = ik.IKSolver(
             model,
             n_problems,
@@ -497,9 +475,7 @@ def test_qp_batch(test, device):
         n_problems = 5
         model = _build_two_link_planar(device)
 
-        joint_q_2d = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
 
         # Different targets for each problem
         target_data = [

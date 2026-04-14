@@ -18,6 +18,8 @@ from .ik_lbfgs_optimizer import IKOptimizerLBFGS
 from .ik_lm_optimizer import IKOptimizerLM
 from .ik_objectives import IKObjective
 from .ik_qp_optimizer import IKOptimizerQP
+from .ik_qp_pgd import IKOptimizerQPPGD
+from .ik_qp_projected_newton import IKOptimizerQPProjectedNewton
 
 
 class IKOptimizer(str, Enum):
@@ -31,6 +33,12 @@ class IKOptimizer(str, Enum):
 
     QP = "qp"
     """Use an ADMM-based QP optimizer for differential IK."""
+
+    QP_PGD = "qp_pgd"
+    """Use a projected gradient descent QP optimizer for differential IK."""
+
+    QP_PN = "qp_pn"
+    """Use a projected-Newton QP optimizer for differential IK."""
 
 
 class IKSampler(str, Enum):
@@ -259,6 +267,10 @@ class IKSolver:
         qp_damping: float = 1e-4,
         qp_dt: float = 0.01,
         qp_velocity_limit: np.ndarray | None = None,
+        # QP PGD parameters
+        qp_pgd_max_iters: int = 50,
+        # QP projected-Newton parameters
+        qp_pn_max_iters: int = 10,
     ) -> None:
         if isinstance(optimizer, str):
             optimizer = IKOptimizer(optimizer)
@@ -349,6 +361,31 @@ class IKSolver:
                 dt=qp_dt,
                 velocity_limit=qp_velocity_limit,
             )
+        elif optimizer is IKOptimizer.QP_PGD:
+            self._impl = IKOptimizerQPPGD(
+                model,
+                self.n_expanded,
+                objectives,
+                problem_idx=self.problem_idx_expanded,
+                jacobian_mode=jacobian_mode,
+                pgd_max_iters=qp_pgd_max_iters,
+                damping=qp_damping,
+                dt=qp_dt,
+                velocity_limit=qp_velocity_limit,
+            )
+        elif optimizer is IKOptimizer.QP_PN:
+            self._impl = IKOptimizerQPProjectedNewton(
+                model,
+                self.n_expanded,
+                objectives,
+                problem_idx=self.problem_idx_expanded,
+                jacobian_mode=jacobian_mode,
+                qp_pn_max_iters=qp_pn_max_iters,
+                qp_tol=qp_tol,
+                damping=qp_damping,
+                dt=qp_dt,
+                velocity_limit=qp_velocity_limit,
+            )
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer}")
 
@@ -387,6 +424,10 @@ class IKSolver:
         elif self.optimizer_type is IKOptimizer.LBFGS:
             self._impl.step(self.joint_q_expanded, self.joint_q_expanded, iterations=iterations)
         elif self.optimizer_type is IKOptimizer.QP:
+            self._impl.step(self.joint_q_expanded, self.joint_q_expanded, iterations=iterations, step_size=step_size)
+        elif self.optimizer_type is IKOptimizer.QP_PGD:
+            self._impl.step(self.joint_q_expanded, self.joint_q_expanded, iterations=iterations, step_size=step_size)
+        elif self.optimizer_type is IKOptimizer.QP_PN:
             self._impl.step(self.joint_q_expanded, self.joint_q_expanded, iterations=iterations, step_size=step_size)
         else:
             raise RuntimeError(f"Unsupported optimizer: {self.optimizer_type}")
