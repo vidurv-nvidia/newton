@@ -685,14 +685,14 @@ class IKOptimizerQPProjectedNewton:
                 damping_diag[i] = damping
             H = wp.tile_diag_add(JtJ, damping_diag)
 
-            # Precompute c = -J^T r (linear term of QP: min 1/2 x^T H x + c^T x)
-            # The gradient of 1/2 ||r + J dq||^2 is J^T(r + J dq), so at dq=0
-            # the gradient is J^T r. The unconstrained min is H dq = -J^T r.
+            # Precompute c = J^T r (linear term of QP: min 1/2 x^T H x + c^T x)
+            # Expanding 1/2 ||r + J dq||^2 = 1/2 dq^T J^T J dq + (J^T r)^T dq + const
+            # so c = J^T r.  The unconstrained minimiser satisfies H dq = -c = -J^T r.
             Jtr_2d = wp.tile_zeros(shape=(DOF, 1), dtype=wp.float32)
             wp.tile_matmul(Jt, r, Jtr_2d)
             c = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
             for i in range(DOF):
-                c[i] = -Jtr_2d[i, 0]
+                c[i] = Jtr_2d[i, 0]
 
             # Load box bounds
             lb_vec = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
@@ -710,66 +710,73 @@ class IKOptimizerQPProjectedNewton:
                 val = wp.min(val, ub_vec[i])
                 x[i] = val
 
+            # Precompute Cholesky once (H is constant across iterations)
+            L = wp.tile_cholesky(H)
+
             for _k in range(max_iters):
                 # 1. Compute gradient: g = H @ x + c
-                # We compute H @ x via (J^T J + damping I) @ x
-                # Using tile ops: g_i = sum_j H[i,j] * x[j] + c[i]
+                x_col = wp.tile_zeros(shape=(DOF, 1), dtype=wp.float32)
+                for i in range(DOF):
+                    x_col[i, 0] = x[i]
+                Hx_col = wp.tile_zeros(shape=(DOF, 1), dtype=wp.float32)
+                wp.tile_matmul(H, x_col, Hx_col)
                 g = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
                 for i in range(DOF):
-                    val = c[i]
-                    for j in range(DOF):
-                        val = val + H[i, j] * x[j]
-                    g[i] = val
+                    g[i] = Hx_col[i, 0] + c[i]
 
-                # 2. Mask gradient: zero out gradient for bound-active variables
-                # If x[i] <= lb[i] and g[i] > 0: variable pinned at lower, gradient pushes further down -> mask
-                # If x[i] >= ub[i] and g[i] < 0: variable pinned at upper, gradient pushes further up -> mask
-                g_masked = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
-                for i in range(DOF):
-                    gi = g[i]
-                    xi = x[i]
-                    if (xi <= lb_vec[i] and gi > 0.0) or (xi >= ub_vec[i] and gi < 0.0):
-                        g_masked[i] = 0.0
-                    else:
-                        g_masked[i] = gi
-
-                # 3. Solve H @ dx = -g_masked via Cholesky
+                # 2. Solve H @ dx = -g via Cholesky (full Newton step)
                 neg_g = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
                 for i in range(DOF):
-                    neg_g[i] = -g_masked[i]
+                    neg_g[i] = -g[i]
 
-                L = wp.tile_cholesky(H)
                 dx = wp.tile_cholesky_solve(L, neg_g)
 
-                # 4. Line search: find max alpha in (0, 1] s.t. lb <= x + alpha*dx <= ub
-                alpha = float(1.0)
+                # 3. Current objective: f = 1/2 x^T H x + c^T x
+                f_cur = float(0.0)
                 for i in range(DOF):
-                    dxi = dx[i]
-                    xi = x[i]
-                    if dxi < 0.0:
-                        # x[i] + alpha * dx[i] >= lb[i]  =>  alpha <= (lb[i] - x[i]) / dx[i]
-                        a_max = (lb_vec[i] - xi) / dxi
-                        if a_max < alpha:
-                            alpha = a_max
-                    elif dxi > 0.0:
-                        # x[i] + alpha * dx[i] <= ub[i]  =>  alpha <= (ub[i] - x[i]) / dx[i]
-                        a_max = (ub_vec[i] - xi) / dxi
-                        if a_max < alpha:
-                            alpha = a_max
+                    f_cur = f_cur + 0.5 * x[i] * Hx_col[i, 0] + c[i] * x[i]
 
-                # 5. Update: x = clamp(x + alpha * dx, lb, ub)
+                # 4. Projected backtracking line search.
+                # Try x_trial = clamp(x + alpha * dx, lb, ub) for
+                # alpha = 1, 1/2, 1/4, ... and accept the first that
+                # decreases the objective.
+                alpha = float(1.0)
+                x_new = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
+
+                for _ls in range(10):
+                    # Compute trial point
+                    x_trial = wp.tile_zeros(shape=(DOF,), dtype=wp.float32)
+                    for i in range(DOF):
+                        val = x[i] + alpha * dx[i]
+                        val = wp.max(val, lb_vec[i])
+                        val = wp.min(val, ub_vec[i])
+                        x_trial[i] = val
+
+                    # Evaluate objective at trial
+                    xt_col = wp.tile_zeros(shape=(DOF, 1), dtype=wp.float32)
+                    for i in range(DOF):
+                        xt_col[i, 0] = x_trial[i]
+                    Hxt_col = wp.tile_zeros(shape=(DOF, 1), dtype=wp.float32)
+                    wp.tile_matmul(H, xt_col, Hxt_col)
+                    f_trial = float(0.0)
+                    for i in range(DOF):
+                        f_trial = f_trial + 0.5 * x_trial[i] * Hxt_col[i, 0] + c[i] * x_trial[i]
+
+                    if f_trial <= f_cur:
+                        x_new = x_trial
+                        break
+
+                    alpha = alpha * 0.5
+                    x_new = x_trial  # use last trial if no decrease found
+
+                # 5. Update and convergence check
                 max_step = float(0.0)
                 for i in range(DOF):
-                    step_i = alpha * dx[i]
-                    val = x[i] + step_i
-                    val = wp.max(val, lb_vec[i])
-                    val = wp.min(val, ub_vec[i])
-                    x[i] = val
-                    abs_step = wp.abs(step_i)
+                    abs_step = wp.abs(x_new[i] - x[i])
                     if abs_step > max_step:
                         max_step = abs_step
+                x = x_new
 
-                # 6. Convergence check
                 if max_step < tol:
                     break
 

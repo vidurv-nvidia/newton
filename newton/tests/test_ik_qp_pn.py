@@ -100,9 +100,7 @@ def test_qp_pn_converges_position(test, device):
         n_problems = 3
         model = _build_two_link_planar(device)
 
-        joint_q_2d = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
         targets = wp.array([[1.5, 1.0, 0.0]] * n_problems, dtype=wp.vec3)
         ee_link = 1
         ee_off = wp.vec3(0.5, 0.0, 0.0)
@@ -143,9 +141,7 @@ def test_qp_pn_respects_joint_limits(test, device):
         n_problems = 2
         model = _build_two_link_planar(device)
 
-        joint_q_2d = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
 
         # Target that requires large joint angles - push toward limits
         targets = wp.array([[0.0, 1.8, 0.0]] * n_problems, dtype=wp.vec3)
@@ -200,9 +196,7 @@ def test_qp_pn_batch(test, device):
         n_problems = 5
         model = _build_two_link_planar(device)
 
-        joint_q_2d = wp.zeros(
-            (n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True
-        )
+        joint_q_2d = wp.zeros((n_problems, model.joint_coord_count), dtype=wp.float32, requires_grad=True)
 
         # Different targets for each problem
         target_data = [
