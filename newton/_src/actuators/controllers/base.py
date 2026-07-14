@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -49,7 +50,25 @@ class Controller:
                     ``None`` resets all.
             """
 
+    @dataclass(frozen=True)
+    class JointConfiguration:
+        """Joint properties a controller requires ModelBuilder to author."""
+
+        target_ke: float | None = None
+        target_kd: float | None = None
+        dry_friction: float | None = None
+        viscous_friction: float | None = None
+
     SHARED_PARAMS: ClassVar[set[str]] = set()
+
+    PER_GROUP_PARAMS: ClassVar[set[str]] = set()
+    """Arguments distributed across calls made by ``ModelBuilder.add_actuator_groups``."""
+
+    supports_external_delay: ClassVar[bool] = True
+    """Whether the controller can be composed with a Newton :class:`Delay`."""
+
+    requires_dynamic_bias: bool = False
+    """Whether :class:`Actuator` should pass ``dynamic_bias`` to :meth:`compute`."""
 
     @classmethod
     def resolve_arguments(cls, args: dict[str, Any]) -> dict[str, Any]:
@@ -63,6 +82,42 @@ class Controller:
         """
         raise NotImplementedError(f"{cls.__name__} must implement resolve_arguments")
 
+    @classmethod
+    def resolve_joint_configurations(
+        cls,
+        args: dict[str, Any],
+        output_count: int,
+    ) -> tuple[JointConfiguration, ...] | None:
+        """Return ordered joint properties for an actuator output group.
+
+        This optional build-time hook is called while the output DOFs are still
+        mutable. Controllers that do not require joint configuration changes
+        return ``None``.
+
+        Args:
+            args: Arguments returned by :meth:`resolve_arguments`.
+            output_count: Number of output DOFs in the authored group.
+
+        Returns:
+            One configuration per output DOF, or ``None``.
+        """
+        return None
+
+    @classmethod
+    def validate_resolved_group(
+        cls,
+        args: dict[str, Any],
+        input_indices: Sequence[int],
+        output_indices: Sequence[int],
+    ) -> None:
+        """Validate one resolved controller group before authoring joint properties.
+
+        Args:
+            args: Arguments returned by :meth:`resolve_arguments`.
+            input_indices: Ordered DOF indices read by the controller.
+            output_indices: Ordered DOF indices receiving controller effort.
+        """
+
     def finalize(self, device: wp.Device, num_actuators: int) -> None:
         """Called by :class:`Actuator` after construction to set up device-specific resources.
 
@@ -74,6 +129,25 @@ class Controller:
             num_actuators: Number of actuators (DOFs) this controller manages.
         """
         pass
+
+    def validate_io(self, input_count: int, output_count: int) -> None:
+        """Validate the number of controller inputs and actuator outputs.
+
+        Controllers whose input and output axes have different sizes must
+        override this method and validate their own shape contract.
+
+        Args:
+            input_count: Number of state and target inputs read by the controller.
+            output_count: Number of efforts written by the controller.
+
+        Raises:
+            ValueError: If the input and output counts differ.
+        """
+        if input_count != output_count:
+            raise ValueError(
+                f"{type(self).__name__} requires equal input and output counts; "
+                f"got {input_count} inputs and {output_count} outputs"
+            )
 
     def compute(
         self,
@@ -99,11 +173,13 @@ class Controller:
             target_pos: Target positions [m or rad].
             target_vel: Target velocities [m/s or rad/s].
             feedforward: Feedforward effort [N or N·m] (may be ``None``).
-            pos_indices: Indices into *positions* for each DOF.
-            vel_indices: Indices into *velocities* for each DOF.
-            target_pos_indices: Indices into *target_pos*.
-            target_vel_indices: Indices into *target_vel* and *feedforward*.
-            forces: Scratch buffer to write effort [N or N·m] to. Shape ``(N,)``.
+            pos_indices: Input-axis indices into *positions*.
+            vel_indices: Input-axis indices into *velocities*.
+            target_pos_indices: Input-axis indices into *target_pos*.
+            target_vel_indices: Input-axis indices into *target_vel* and
+                *feedforward*.
+            forces: Output-axis scratch buffer to write effort [N or N·m].
+                Shape ``(output_count,)``.
             state: Controller state (``None`` if stateless).
             dt: Timestep [s].
             device: Warp device for kernel launches.

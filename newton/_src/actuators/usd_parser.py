@@ -13,7 +13,14 @@ from typing import Any
 from newton._src.usd.utils import _resolve_asset_path, get_applied_api_schemas
 
 from .clamping import Clamping, ClampingDCMotor, ClampingMaxEffort, ClampingPositionBased
-from .controllers import Controller, ControllerNeuralLSTM, ControllerNeuralMLP, ControllerPD, ControllerPID
+from .controllers import (
+    Controller,
+    ControllerNeuralGRU,
+    ControllerNeuralLSTM,
+    ControllerNeuralMLP,
+    ControllerPD,
+    ControllerPID,
+)
 from .delay import Delay
 from .utils import load_metadata
 
@@ -94,6 +101,7 @@ class _SchemaEntry:
 
 
 _NEURAL_CONTROLLER_TYPES: dict[str, type[Controller]] = {
+    "gru": ControllerNeuralGRU,
     "mlp": ControllerNeuralMLP,
     "lstm": ControllerNeuralLSTM,
 }
@@ -103,7 +111,8 @@ def _resolve_neural_control(kwargs: dict[str, Any]) -> type[Controller]:
     """Validate neural-control kwargs and return the concrete controller class.
 
     Inspects the checkpoint's ``model_type`` metadata to choose between
-    :class:`ControllerNeuralMLP` and :class:`ControllerNeuralLSTM`.
+    :class:`ControllerNeuralMLP`, :class:`ControllerNeuralLSTM`, and
+    :class:`ControllerNeuralGRU`.
 
     Raises:
         ValueError: If ``model_path`` is empty or the checkpoint's

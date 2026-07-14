@@ -94,12 +94,16 @@ class Actuator:
         control_output_attr: str = "joint_f",
         control_computed_output_attr: str | None = None,
         requires_grad: bool = False,
+        *,
+        input_indices: wp.array[wp.uint32] | None = None,
+        input_pos_indices: wp.array[wp.uint32] | None = None,
+        input_target_pos_indices: wp.array[wp.uint32] | None = None,
     ):
         """Initialize actuator.
 
         Args:
-            indices: DOF indices into velocity-shaped arrays (velocities,
-                velocity targets, feedforward, effort output). Shape ``(N,)``.
+            indices: Output-axis DOF indices used for clamping and effort
+                output. Shape ``(N,)``.
             controller: Controller that computes raw effort.
             delay: Optional Delay instance for input delay.
             clamping: List of Clamping objects (post-controller effort bounds).
@@ -132,6 +136,15 @@ class Actuator:
                 effort. None to skip writing computed effort.
             requires_grad: Allocate intermediate arrays with gradient support
                 for differentiable simulation.
+            input_indices: DOF indices into velocity-shaped state and target
+                arrays read by the controller. Must be supplied together with
+                *input_pos_indices* and *input_target_pos_indices*. Omit all
+                three to reuse the output axis. ModelBuilder supplies them for
+                grouped controllers.
+            input_pos_indices: Indices into coordinate-shaped position arrays
+                read by the controller.
+            input_target_pos_indices: Indices into position-target arrays read
+                by the controller.
         """
         self.indices = indices
         self.pos_indices = pos_indices if pos_indices is not None else indices
@@ -152,10 +165,43 @@ class Actuator:
             raise ValueError(
                 f"effort_indices shape {self.effort_indices.shape} must match indices shape {indices.shape}"
             )
+        input_axis = (input_indices, input_pos_indices, input_target_pos_indices)
+        if any(value is None for value in input_axis) and any(value is not None for value in input_axis):
+            raise ValueError("input_indices, input_pos_indices, and input_target_pos_indices must be provided together")
+        if input_indices is None:
+            self.input_indices = indices
+            self.input_pos_indices = self.pos_indices
+            self.input_target_pos_indices = self.target_pos_indices
+        else:
+            self.input_indices = input_indices
+            self.input_pos_indices = input_pos_indices
+            self.input_target_pos_indices = input_target_pos_indices
+        if self.input_pos_indices.shape != self.input_indices.shape:
+            raise ValueError(
+                f"input_pos_indices shape {self.input_pos_indices.shape} "
+                f"must match input_indices shape {self.input_indices.shape}"
+            )
+        if self.input_target_pos_indices.shape != self.input_indices.shape:
+            raise ValueError(
+                f"input_target_pos_indices shape {self.input_target_pos_indices.shape} "
+                f"must match input_indices shape {self.input_indices.shape}"
+            )
         self.controller = controller
         self.delay = delay
         self.clamping = clamping or []
         self.num_actuators = len(indices)
+        self.num_inputs = len(self.input_indices)
+        if delay is not None:
+            if not controller.supports_external_delay:
+                raise ValueError(f"{type(controller).__name__} cannot be combined with a Newton Delay")
+            if len(delay.delay_steps) != self.num_inputs:
+                raise ValueError(
+                    f"Delay delay_steps length {len(delay.delay_steps)} must match "
+                    f"Actuator input count {self.num_inputs}"
+                )
+            if self.num_inputs != self.num_actuators:
+                raise ValueError("Actuator Delay requires equal input and output counts")
+        controller.validate_io(self.num_inputs, self.num_actuators)
 
         self.state_pos_attr = state_pos_attr
         self.state_vel_attr = state_vel_attr
@@ -232,6 +278,8 @@ class Actuator:
         current_act_state: Actuator.State | None = None,
         next_act_state: Actuator.State | None = None,
         dt: float | None = None,
+        *,
+        dynamic_bias: wp.array[float] | None = None,
     ) -> None:
         """Execute one control step.
 
@@ -252,6 +300,10 @@ class Actuator:
             current_act_state: Current composed state (None if stateless).
             next_act_state: Next composed state (None if stateless).
             dt: Timestep [s].
+            dynamic_bias: Optional generalized gravity, Coriolis, and
+                centrifugal force observation [N or N·m], in joint-DOF
+                layout. It is passed to controllers that request it and is
+                never added directly to actuator effort.
         """
         if self.is_stateful() and (current_act_state is None or next_act_state is None):
             raise ValueError(
@@ -270,8 +322,8 @@ class Actuator:
         target_pos = orig_target_pos
         target_vel = orig_target_vel
         feedforward = orig_feedforward
-        target_pos_indices = self.target_pos_indices
-        target_vel_indices = self.indices
+        target_pos_indices = self.input_target_pos_indices
+        target_vel_indices = self.input_indices
 
         # --- 1. Delay read (from current_state) ---
         if self.delay is not None:
@@ -279,8 +331,8 @@ class Actuator:
                 orig_target_pos,
                 orig_target_vel,
                 orig_feedforward,
-                self.target_pos_indices,
-                self.indices,
+                self.input_target_pos_indices,
+                self.input_indices,
                 current_act_state.delay_state,
             )
             target_pos_indices = self._sequential_indices
@@ -288,20 +340,24 @@ class Actuator:
 
         # --- 2. Controller: compute raw effort ---
         ctrl_state = current_act_state.controller_state if current_act_state else None
+        controller_kwargs: dict[str, Any] = {}
+        if self.controller.requires_dynamic_bias:
+            controller_kwargs["dynamic_bias"] = dynamic_bias
         self.controller.compute(
             positions,
             velocities,
             target_pos,
             target_vel,
             feedforward,
-            self.pos_indices,
-            self.indices,
+            self.input_pos_indices,
+            self.input_indices,
             target_pos_indices,
             target_vel_indices,
             self._computed_forces,
             ctrl_state,
             dt,
             device=self.device,
+            **controller_kwargs,
         )
 
         # --- 3. Clamping: computed → applied ---
@@ -349,8 +405,8 @@ class Actuator:
                 orig_target_pos,
                 orig_target_vel,
                 orig_feedforward,
-                self.target_pos_indices,
-                self.indices,
+                self.input_target_pos_indices,
+                self.input_indices,
                 current_act_state.delay_state,
                 next_act_state.delay_state,
             )
