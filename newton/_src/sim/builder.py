@@ -12,7 +12,7 @@ import math
 import warnings
 from collections import Counter, deque
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
@@ -332,13 +332,13 @@ class ModelBuilder:
         clamping_classes: tuple  # Tuple of Clamping subclass types (in order)
         clamping_shared_kwargs: tuple  # Tuple of dicts: shared kwargs per clamping class
         controller_shared_kwargs: dict  # Shared controller kwargs (e.g. model_path)
-        indices: list[int]  # Per-actuator DOF indices (joint_qd layout)
-        pos_indices: list[int]  # Per-actuator position indices (joint_q layout)
-        input_indices: list[int]  # Controller input indices (joint_qd layout)
-        input_pos_indices: list[int]  # Controller input position indices (joint_q layout)
-        controller_args: list[dict[str, Any]]  # Per-actuator controller array params
-        delay_args: list[dict[str, Any]]  # Per-actuator delay params (empty if no delay)
-        clamping_args: list[list[dict[str, Any]]]  # Per-actuator per-clamping array params
+        indices: list[int] = field(default_factory=list)  # Output DOF indices (joint_qd layout)
+        pos_indices: list[int] = field(default_factory=list)  # Output position indices (joint_q layout)
+        input_indices: list[int] = field(default_factory=list)  # Input DOF indices (joint_qd layout)
+        input_pos_indices: list[int] = field(default_factory=list)  # Input position indices (joint_q layout)
+        controller_args: list[dict[str, Any]] = field(default_factory=list)  # Per-output controller parameters
+        delay_args: list[dict[str, Any]] = field(default_factory=list)  # Per-output delay parameters
+        clamping_args: list[list[dict[str, Any]]] = field(default_factory=list)  # Per-output clamp parameters
 
     @dataclass
     class BvhConfig:
@@ -2092,6 +2092,87 @@ class ModelBuilder:
             controller_kwargs=kwargs,
         )
 
+    def add_actuator_groups(
+        self,
+        controller_class: type[Controller] | None = None,
+        input_indices: Sequence[Sequence[int]] | None = None,
+        output_indices: Sequence[Sequence[int]] | None = None,
+        clamping: list[tuple[type[Clamping], dict[str, Any]]] | None = None,
+        delay_steps: int | None = None,
+        input_pos_indices: Sequence[Sequence[int]] | None = None,
+        output_pos_indices: Sequence[Sequence[int]] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Add multiple controller groups while preserving their boundaries.
+
+        Each inner index sequence is one independent controller application.
+        Arguments named by ``controller_class.PER_GROUP_PARAMS`` may be passed
+        as an outer sequence with one value per group; scalar values apply to
+        every group. Compatible groups are batched into one runtime actuator.
+
+        Args:
+            controller_class: Controller class for every group.
+            input_indices: Ordered input DOF indices for each group.
+            output_indices: Ordered output DOF indices for each group.
+            clamping: Optional shared clamping component specifications.
+            delay_steps: Optional shared input delay [timesteps].
+            input_pos_indices: Optional input coordinate indices for each group.
+            output_pos_indices: Optional output coordinate indices for each group.
+            **kwargs: Shared or per-group controller arguments.
+        """
+        if controller_class is None:
+            raise TypeError("add_actuator_groups() requires 'controller_class'")
+        if input_indices is None:
+            raise TypeError("add_actuator_groups() missing required argument: 'input_indices'")
+        if output_indices is None:
+            raise TypeError("add_actuator_groups() missing required argument: 'output_indices'")
+
+        input_groups = [list(group) for group in input_indices]
+        output_groups = [list(group) for group in output_indices]
+        group_count = len(input_groups)
+        if group_count == 0:
+            raise ValueError("add_actuator_groups() requires at least one group")
+        if len(output_groups) != group_count:
+            raise ValueError("output_indices must contain one entry per input group")
+        output_dofs = [index for group in output_groups for index in group]
+        if len(set(output_dofs)) != len(output_dofs):
+            raise ValueError("output_indices must not overlap across actuator groups")
+
+        input_position_groups = [None] * group_count if input_pos_indices is None else list(input_pos_indices)
+        output_position_groups = [None] * group_count if output_pos_indices is None else list(output_pos_indices)
+        if len(input_position_groups) != group_count:
+            raise ValueError("input_pos_indices must contain one entry per input group")
+        if len(output_position_groups) != group_count:
+            raise ValueError("output_pos_indices must contain one entry per input group")
+
+        per_group_arguments: dict[str, Sequence[Any]] = {}
+        for name in controller_class.PER_GROUP_PARAMS:
+            value = kwargs.get(name)
+            if isinstance(value, np.ndarray):
+                if value.ndim != 1:
+                    raise ValueError(f"{name} must be a one-dimensional sequence")
+                value = value.tolist()
+            if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+                if len(value) != group_count:
+                    raise ValueError(f"{name} must contain one value per actuator group")
+                per_group_arguments[name] = value
+
+        for group_index in range(group_count):
+            group_kwargs = dict(kwargs)
+            for name, values in per_group_arguments.items():
+                group_kwargs[name] = values[group_index]
+            self._add_actuator_entry(
+                method_name="add_actuator_groups",
+                controller_class=controller_class,
+                input_indices=input_groups[group_index],
+                output_indices=output_groups[group_index],
+                clamping=clamping,
+                delay_steps=delay_steps,
+                input_pos_indices=input_position_groups[group_index],
+                output_pos_indices=output_position_groups[group_index],
+                controller_kwargs=group_kwargs,
+            )
+
     def _add_actuator_entry(
         self,
         *,
@@ -2175,13 +2256,6 @@ class ModelBuilder:
                 clamping_classes=clamping_classes,
                 clamping_shared_kwargs=tuple(clamping_shared),
                 controller_shared_kwargs=controller_shared,
-                indices=[],
-                pos_indices=[],
-                input_indices=[],
-                input_pos_indices=[],
-                controller_args=[],
-                delay_args=[],
-                clamping_args=[],
             ),
         )
 
@@ -4184,23 +4258,12 @@ class ModelBuilder:
                     clamping_classes=sub_entry.clamping_classes,
                     clamping_shared_kwargs=sub_entry.clamping_shared_kwargs,
                     controller_shared_kwargs=sub_entry.controller_shared_kwargs,
-                    indices=[],
-                    pos_indices=[],
-                    input_indices=[],
-                    input_pos_indices=[],
-                    controller_args=[],
-                    delay_args=[],
-                    clamping_args=[],
                 ),
             )
-            for idx in sub_entry.indices:
-                entry.indices.append(idx + start_joint_dof_idx)
-            for idx in sub_entry.pos_indices:
-                entry.pos_indices.append(idx + start_joint_coord_idx)
-            for idx in sub_entry.input_indices:
-                entry.input_indices.append(idx + start_joint_dof_idx)
-            for idx in sub_entry.input_pos_indices:
-                entry.input_pos_indices.append(idx + start_joint_coord_idx)
+            entry.indices.extend(idx + start_joint_dof_idx for idx in sub_entry.indices)
+            entry.pos_indices.extend(idx + start_joint_coord_idx for idx in sub_entry.pos_indices)
+            entry.input_indices.extend(idx + start_joint_dof_idx for idx in sub_entry.input_indices)
+            entry.input_pos_indices.extend(idx + start_joint_coord_idx for idx in sub_entry.input_pos_indices)
             entry.controller_args.extend(sub_entry.controller_args)
             entry.delay_args.extend(sub_entry.delay_args)
             entry.clamping_args.extend(sub_entry.clamping_args)

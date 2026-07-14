@@ -61,6 +61,9 @@ class Controller:
 
     SHARED_PARAMS: ClassVar[set[str]] = set()
 
+    PER_GROUP_PARAMS: ClassVar[set[str]] = set()
+    """Arguments distributed across calls made by ``ModelBuilder.add_actuator_groups``."""
+
     supports_external_delay: ClassVar[bool] = True
     """Whether the controller can be composed with a Newton :class:`Delay`."""
 

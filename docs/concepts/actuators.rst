@@ -274,10 +274,11 @@ as learned with zero external delay, so :class:`ControllerNeuralGRU` cannot be
 combined with a Newton :class:`Delay`.
 
 Register GRUs through :meth:`~newton.ModelBuilder.add_actuator` for a scalar
-mapping or :meth:`~newton.ModelBuilder.add_actuator_group` for separate input
-and output axes.  These builder paths install the target mode, PD gains, and
-friction encoded in metadata before the model is finalized.  Constructing an
-:class:`Actuator` directly does not edit an already-finalized :class:`Model`.
+mapping, :meth:`~newton.ModelBuilder.add_actuator_group` for separate input and
+output axes, or :meth:`~newton.ModelBuilder.add_actuator_groups` for multiple
+compatible mappings.  These builder paths install the target mode, PD gains,
+and friction encoded in metadata before the model is finalized.  Constructing
+an :class:`Actuator` directly does not edit an already-finalized :class:`Model`.
 
 For example, register a grouped MISO mapping with:
 
@@ -293,13 +294,24 @@ For example, register a grouped MISO mapping with:
        mapping_index=0,
    )
 
-Repeat compatible registrations with the same artifact and the corresponding
-``mapping_index`` for Shared SISO.  They are batched into one network forward,
-with a separate recurrent row (hidden state and previous torque) for every
-mapping application.  The current USD actuator importer registers one scalar
-target and does not author ``mapping_index``.  Consequently, USD supports only
-a single-mapping SISO GRU archive; Shared SISO, MISO, and MIMO archives must be
-registered with :meth:`~newton.ModelBuilder.add_actuator_group`.
+Register Shared SISO mappings together:
+
+.. code-block:: python
+
+   builder.add_actuator_groups(
+       ControllerNeuralGRU,
+       input_indices=[[rotation], [shoulder], [elbow]],
+       output_indices=[[rotation], [shoulder], [elbow]],
+       model_path="arm_gru.pt",
+       mapping_index=[0, 1, 2],
+   )
+
+Compatible mappings are batched into one network forward, with a separate
+recurrent row (hidden state and previous torque) for every mapping application.
+The current USD actuator importer registers one scalar target and does not
+author ``mapping_index``.  Consequently, USD supports only a single-mapping
+SISO GRU archive; Shared SISO, MISO, and MIMO archives must be registered with
+the grouped builder APIs.
 
 Differentiability and Graph Capture
 -----------------------------------

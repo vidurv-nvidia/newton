@@ -410,6 +410,7 @@ class ControllerNeuralGRU(Controller):
     """
 
     SHARED_PARAMS: ClassVar[set[str]] = {"model_path"}
+    PER_GROUP_PARAMS: ClassVar[set[str]] = {"mapping_index"}
     supports_external_delay: ClassVar[bool] = False
 
     @dataclass

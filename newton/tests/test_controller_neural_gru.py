@@ -208,18 +208,43 @@ class TestControllerNeuralGRU(unittest.TestCase):
             for index, link in enumerate(links)
         ]
         builder.add_articulation(joints)
-        for mapping_index, joint in enumerate(joints):
-            dof = builder.joint_qd_start[joint]
-            coord = builder.joint_q_start[joint]
-            builder.add_actuator_group(
+        dofs = [builder.joint_qd_start[joint] for joint in joints]
+        coords = [builder.joint_q_start[joint] for joint in joints]
+
+        with self.assertRaisesRegex(ValueError, "one entry per input group"):
+            builder.add_actuator_groups(
                 ControllerNeuralGRU,
-                input_indices=[dof],
-                output_indices=[dof],
-                input_pos_indices=[coord],
-                output_pos_indices=[coord],
+                input_indices=[[dof] for dof in dofs],
+                output_indices=[[dofs[0]]],
                 model_path=path,
-                mapping_index=mapping_index,
+                mapping_index=[0, 1],
             )
+        with self.assertRaisesRegex(ValueError, "must not overlap"):
+            builder.add_actuator_groups(
+                ControllerNeuralGRU,
+                input_indices=[[dofs[0]], [dofs[0]]],
+                output_indices=[[dofs[0]], [dofs[0]]],
+                model_path=path,
+                mapping_index=[0, 1],
+            )
+        with self.assertRaisesRegex(ValueError, "one value per actuator group"):
+            builder.add_actuator_groups(
+                ControllerNeuralGRU,
+                input_indices=[[dof] for dof in dofs],
+                output_indices=[[dof] for dof in dofs],
+                model_path=path,
+                mapping_index=[0],
+            )
+
+        builder.add_actuator_groups(
+            ControllerNeuralGRU,
+            input_indices=[[dof] for dof in dofs],
+            output_indices=[[dof] for dof in dofs],
+            input_pos_indices=[[coord] for coord in coords],
+            output_pos_indices=[[coord] for coord in coords],
+            model_path=path,
+            mapping_index=np.arange(len(mappings)),
+        )
 
         model = builder.finalize(device=self.device)
         self.assertEqual(len(model.actuators), 1)
