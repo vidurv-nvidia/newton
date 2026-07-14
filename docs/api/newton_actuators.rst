@@ -34,6 +34,7 @@ construction.
    ClampingPositionBased
    ComponentKind
    Controller
+   ControllerNeuralGRU
    ControllerNeuralLSTM
    ControllerNeuralMLP
    ControllerPD

@@ -222,6 +222,79 @@ may omit them: they contain the original module, whose ``torch.nn.LSTM``
 submodule is inspected directly, while ``torch.export`` flattens the network
 into a computation graph that no longer exposes it.
 
+Schema-v3 GRU Checkpoints
+^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:class:`ControllerNeuralGRU` runs Anchor Bench schema-v3 TorchScript archives.
+Construct it with ``ControllerNeuralGRU(model_path, mapping_index=None)``.
+``mapping_index`` selects an entry in the archive's ordered
+``joint_mappings`` list and is required when the archive contains more than
+one mapping.  The selected mapping defines the ordered input and output joint
+axes; mappings may describe SISO, MISO, or MIMO applications of the same
+weights.
+
+At each control step, the controller assembles feature blocks in the exact
+``input_columns`` order stored in metadata.  ``position``,
+``position_error``, ``velocity``, ``solver_pd``, and ``dynamic_bias`` have one
+value per input joint.  ``previous_torque`` has one value per output joint.
+``solver_pd`` always uses the metadata's zero-velocity target:
+``kp * (target_position - position) - kd * velocity``.  It does not consume
+``joint_target_qd``.  The features are normalized using the archive statistics
+and passed to the model as ``(group_count, 1, input_size)``; the model returns
+``(group_count, 1, output_size)``.
+
+``dynamic_bias`` is an observation supplied by the caller through
+``Actuator.step(..., dynamic_bias=bias)`` in joint-DOF layout.  Newton selects
+the configured input joints, but does not calculate the observation or add it
+to effort.  It is required only when the archive declares that feature.
+
+``previous_torque`` is the preceding denormalized network output before any
+clamping.  It starts at physical zero and returns to zero, together with the
+GRU hidden state, when the actuator state is reset.  For a residual model it
+therefore means the previous residual, not the previous total solver effort.
+
+The archive's single target semantic controls how output is applied:
+
+* ``torque`` means full actuator effort; the target joints' solver PD gains
+  are set to zero.
+* ``torque_residual`` means residual effort; the PD and friction baseline from
+  metadata is installed on the target joints and remains solver-side.
+
+Normal actuator clamping is applied after either raw network output.  For a
+residual model, the solver's ``joint_target_qd`` must remain zero so its
+implicit PD baseline matches the metadata's zero-velocity target.  Each call
+must use the archive's exact ``sample_dt_s``.  Schema-v3 archives declare delay
+as learned with zero external delay, so :class:`ControllerNeuralGRU` cannot be
+combined with a Newton :class:`Delay`.
+
+Register GRUs through :meth:`~newton.ModelBuilder.add_actuator` for a scalar
+mapping or :meth:`~newton.ModelBuilder.add_actuator_group` for separate input
+and output axes.  These builder paths install the target mode, PD gains, and
+friction encoded in metadata before the model is finalized.  Constructing an
+:class:`Actuator` directly does not edit an already-finalized :class:`Model`.
+
+For example, register a grouped MISO mapping with:
+
+.. code-block:: python
+
+   from newton.actuators import ControllerNeuralGRU
+
+   builder.add_actuator_group(
+       ControllerNeuralGRU,
+       input_indices=[shoulder_pitch, shoulder_roll, shoulder_yaw, elbow],
+       output_indices=[elbow],
+       model_path="arm_gru.pt",
+       mapping_index=0,
+   )
+
+Repeat compatible registrations with the same artifact and the corresponding
+``mapping_index`` for shared SISO.  They are batched into one network forward,
+with a separate recurrent row (hidden state and previous torque) for every
+mapping application.  The current USD actuator importer registers one scalar
+target and does not author ``mapping_index``.  Consequently, USD supports only
+a single-mapping SISO GRU archive; shared SISO, MISO, and MIMO archives must be
+registered with :meth:`~newton.ModelBuilder.add_actuator_group`.
+
 Differentiability and Graph Capture
 -----------------------------------
 
@@ -250,6 +323,8 @@ Controllers
   (stateful: position/velocity history buffers).
 * :class:`ControllerNeuralLSTM` — LSTM neural-network controller
   (stateful: hidden/cell state).
+* :class:`ControllerNeuralGRU` — schema-v3 GRU neural-network controller
+  (stateful: hidden state and previous raw network effort).
 
 See the API documentation for each controller's control-law equations.
 

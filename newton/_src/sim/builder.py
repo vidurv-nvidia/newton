@@ -320,10 +320,11 @@ class ModelBuilder:
     class ActuatorEntry:
         """Stores accumulated specs for one group of compatible composed actuators.
 
-        Each element in ``indices`` is a single DOF index.  The entry key is
-        ``(controller_class, delay_steps is not None, clamping_key, ctrl_shared_key)``
-        where shared params (e.g. ``model_path``, lookup tables) must
-        be identical across all actuators in a group.  Delay step values
+        ``indices`` and ``pos_indices`` define the output axis; their input-axis
+        counterparts may have a different width. The entry key includes both
+        axis widths in addition to the controller, delay, clamping, and shared
+        parameters. Shared parameters (e.g. ``model_path``, lookup tables)
+        must be identical across all actuators in a group. Delay step values
         are per-DOF; the buffer is sized to ``max(delay_step_values) + 1``.
         """
 
@@ -333,6 +334,8 @@ class ModelBuilder:
         controller_shared_kwargs: dict  # Shared controller kwargs (e.g. model_path)
         indices: list[int]  # Per-actuator DOF indices (joint_qd layout)
         pos_indices: list[int]  # Per-actuator position indices (joint_q layout)
+        input_indices: list[int]  # Controller input indices (joint_qd layout)
+        input_pos_indices: list[int]  # Controller input position indices (joint_q layout)
         controller_args: list[dict[str, Any]]  # Per-actuator controller array params
         delay_args: list[dict[str, Any]]  # Per-actuator delay params (empty if no delay)
         clamping_args: list[list[dict[str, Any]]]  # Per-actuator per-clamping array params
@@ -1452,7 +1455,8 @@ class ModelBuilder:
         """Running counts for custom string frequencies used to size custom attribute arrays."""
 
         # Actuator entries (accumulated during add_actuator calls)
-        # Key is (controller_class, delay is not None, clamping_key, ctrl_shared_key) to group compatible actuators
+        # The key combines component types/shared parameters, delay presence,
+        # and input/output widths to group compatible actuators.
         self.actuator_entries: dict[tuple, ModelBuilder.ActuatorEntry] = {}
         """Actuator entry groups accumulated from :meth:`add_actuator`, keyed by controller class and shared params."""
 
@@ -2021,76 +2025,240 @@ class ModelBuilder:
         """
         if controller_class is None:
             raise TypeError("add_actuator() requires 'controller_class'")
-
         if index is None:
             raise TypeError("add_actuator() missing required argument: 'index'")
 
-        clamping = clamping or []
+        self._add_actuator_entry(
+            method_name="add_actuator",
+            controller_class=controller_class,
+            input_indices=[index],
+            output_indices=[index],
+            clamping=clamping,
+            delay_steps=delay_steps,
+            input_pos_indices=[index if pos_index is None else pos_index],
+            output_pos_indices=[index if pos_index is None else pos_index],
+            controller_kwargs=kwargs,
+        )
 
-        # --- Resolve controller kwargs and separate shared from per-DOF ---
-        resolved_ctrl = controller_class.resolve_arguments(kwargs)
-        unrecognized = set(kwargs) - set(resolved_ctrl)
+    def add_actuator_group(
+        self,
+        controller_class: type[Controller] | None = None,
+        input_indices: Sequence[int] | None = None,
+        output_indices: Sequence[int] | None = None,
+        clamping: list[tuple[type[Clamping], dict[str, Any]]] | None = None,
+        delay_steps: int | None = None,
+        input_pos_indices: Sequence[int] | None = None,
+        output_pos_indices: Sequence[int] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Add one controller group with independent ordered input and output axes.
+
+        Repeated calls with compatible component types, shared parameters, and
+        axis widths are batched into one runtime :class:`~newton.actuators.Actuator`.
+        Controller array parameters and clamping parameters are repeated over
+        the output axis. Use controller arguments such as ``model_path`` and
+        ``mapping_index`` to select a mapped neural controller.
+
+        Args:
+            controller_class: Controller class for the group.
+            input_indices: Ordered DOF indices read by the controller.
+            output_indices: Ordered DOF indices receiving controller effort.
+            clamping: Optional clamping component specifications.
+            delay_steps: Optional uniform input delay [timesteps]. Independent
+                input/output widths do not currently support delay.
+            input_pos_indices: Ordered coordinate indices read by the controller.
+                Defaults to *input_indices*.
+            output_pos_indices: Ordered coordinate indices used for output
+                clamping. Defaults to *output_indices*.
+            **kwargs: Controller arguments, including shared mapped-model
+                arguments such as ``model_path`` and ``mapping_index``.
+        """
+        if controller_class is None:
+            raise TypeError("add_actuator_group() requires 'controller_class'")
+        if input_indices is None:
+            raise TypeError("add_actuator_group() missing required argument: 'input_indices'")
+        if output_indices is None:
+            raise TypeError("add_actuator_group() missing required argument: 'output_indices'")
+
+        self._add_actuator_entry(
+            method_name="add_actuator_group",
+            controller_class=controller_class,
+            input_indices=input_indices,
+            output_indices=output_indices,
+            clamping=clamping,
+            delay_steps=delay_steps,
+            input_pos_indices=input_pos_indices,
+            output_pos_indices=output_pos_indices,
+            controller_kwargs=kwargs,
+        )
+
+    def _add_actuator_entry(
+        self,
+        *,
+        method_name: str,
+        controller_class: type[Controller],
+        input_indices: Sequence[int],
+        output_indices: Sequence[int],
+        clamping: list[tuple[type[Clamping], dict[str, Any]]] | None,
+        delay_steps: int | None,
+        input_pos_indices: Sequence[int] | None,
+        output_pos_indices: Sequence[int] | None,
+        controller_kwargs: dict[str, Any],
+    ) -> None:
+        """Resolve and append one scalar or grouped actuator specification."""
+        input_dofs = list(input_indices)
+        output_dofs = list(output_indices)
+        if not input_dofs:
+            raise ValueError(f"{method_name}() requires at least one input index")
+        if not output_dofs:
+            raise ValueError(f"{method_name}() requires at least one output index")
+
+        input_positions = list(input_dofs if input_pos_indices is None else input_pos_indices)
+        output_positions = list(output_dofs if output_pos_indices is None else output_pos_indices)
+        if len(input_positions) != len(input_dofs):
+            raise ValueError("input_pos_indices must match input_indices length")
+        if len(output_positions) != len(output_dofs):
+            raise ValueError("output_pos_indices must match output_indices length")
+        if delay_steps is not None and len(input_dofs) != len(output_dofs):
+            raise ValueError(f"{method_name} does not support Delay when input and output widths differ")
+
+        resolved_controller = controller_class.resolve_arguments(controller_kwargs)
+        unrecognized = set(controller_kwargs) - set(resolved_controller)
         if unrecognized:
             warnings.warn(
-                f"add_actuator: {controller_class.__name__} ignoring "
+                f"{method_name}: {controller_class.__name__} ignoring "
                 f"unrecognized parameter(s): {', '.join(sorted(unrecognized))}",
-                stacklevel=2,
+                stacklevel=3,
             )
-        ctrl_shared_names = getattr(controller_class, "SHARED_PARAMS", set())
-        ctrl_shared = {k: resolved_ctrl[k] for k in ctrl_shared_names if k in resolved_ctrl}
-        ctrl_array_params = {k: v for k, v in resolved_ctrl.items() if k not in ctrl_shared_names}
 
-        # --- Resolve per-clamping kwargs and separate shared from per-DOF ---
-        clamping_classes = tuple(cc for cc, _ in clamping)
-        clamping_shared_list = []
-        clamping_array_params_list = []
-        for comp_class, comp_kwargs in clamping:
-            resolved_comp = comp_class.resolve_arguments(comp_kwargs)
-            comp_shared_names = getattr(comp_class, "SHARED_PARAMS", set())
-            comp_shared = {k: resolved_comp[k] for k in comp_shared_names if k in resolved_comp}
-            comp_array = {k: v for k, v in resolved_comp.items() if k not in comp_shared_names}
-            clamping_shared_list.append(comp_shared)
-            clamping_array_params_list.append(comp_array)
-
-        clamping_shared_kwargs = tuple(clamping_shared_list)
-
-        # --- Build entry key: identifies a group of compatible actuators ---
-        # Groups differ when controller class, presence of delay, clamping
-        # types/shared-params, or controller shared params differ.
-        # Delay values are per-DOF; the buffer is sized to max(delays).
-        def _make_hashable(v: Any) -> Any:
-            if isinstance(v, list):
-                return tuple(v)
-            return v
-
-        ctrl_shared_key = tuple(sorted((k, _make_hashable(v)) for k, v in ctrl_shared.items()))
-        clamping_key = tuple(
-            (cc, tuple(sorted((k, _make_hashable(v)) for k, v in shared.items())))
-            for cc, shared in zip(clamping_classes, clamping_shared_list, strict=True)
+        controller_class.validate_resolved_group(resolved_controller, input_dofs, output_dofs)
+        joint_configurations = controller_class.resolve_joint_configurations(
+            resolved_controller, len(output_dofs), delay_steps
         )
-        entry_key = (controller_class, delay_steps is not None, clamping_key, ctrl_shared_key)
+        if joint_configurations is not None:
+            if len(joint_configurations) != len(output_dofs):
+                raise ValueError(
+                    f"{controller_class.__name__}.resolve_joint_configurations returned "
+                    f"{len(joint_configurations)} entries for {len(output_dofs)} output DOFs"
+                )
+            self._author_actuator_joint_configurations(
+                method_name, controller_class, resolved_controller, output_dofs, joint_configurations
+            )
 
+        controller_shared, controller_array = self._split_actuator_arguments(
+            resolved_controller, controller_class.SHARED_PARAMS
+        )
+        clamping_classes = tuple(component_class for component_class, _ in (clamping or []))
+        clamping_shared: list[dict[str, Any]] = []
+        clamping_array: list[dict[str, Any]] = []
+        for component_class, component_kwargs in clamping or []:
+            resolved_component = component_class.resolve_arguments(component_kwargs)
+            shared, array = self._split_actuator_arguments(resolved_component, component_class.SHARED_PARAMS)
+            clamping_shared.append(shared)
+            clamping_array.append(array)
+
+        entry_key = (
+            controller_class,
+            delay_steps is not None,
+            tuple(
+                (component_class, self._actuator_arguments_key(shared))
+                for component_class, shared in zip(clamping_classes, clamping_shared, strict=True)
+            ),
+            self._actuator_arguments_key(controller_shared),
+            len(input_dofs),
+            len(output_dofs),
+        )
         entry = self.actuator_entries.setdefault(
             entry_key,
             ModelBuilder.ActuatorEntry(
                 controller_class=controller_class,
                 clamping_classes=clamping_classes,
-                clamping_shared_kwargs=clamping_shared_kwargs,
-                controller_shared_kwargs=ctrl_shared,
+                clamping_shared_kwargs=tuple(clamping_shared),
+                controller_shared_kwargs=controller_shared,
                 indices=[],
                 pos_indices=[],
+                input_indices=[],
+                input_pos_indices=[],
                 controller_args=[],
                 delay_args=[],
                 clamping_args=[],
             ),
         )
 
-        entry.indices.append(index)
-        entry.pos_indices.append(pos_index if pos_index is not None else index)
-        entry.controller_args.append(ctrl_array_params)
+        entry.indices.extend(output_dofs)
+        entry.pos_indices.extend(output_positions)
+        entry.input_indices.extend(input_dofs)
+        entry.input_pos_indices.extend(input_positions)
+        entry.controller_args.extend(dict(controller_array) for _ in output_dofs)
         if delay_steps is not None:
-            entry.delay_args.append({"delay_steps": delay_steps})
-        entry.clamping_args.append(clamping_array_params_list)
+            entry.delay_args.extend({"delay_steps": delay_steps} for _ in output_dofs)
+        entry.clamping_args.extend([dict(arguments) for arguments in clamping_array] for _ in output_dofs)
+
+    @staticmethod
+    def _split_actuator_arguments(
+        arguments: dict[str, Any], shared_names: set[str]
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Split resolved component arguments into shared and per-output values."""
+        shared = {key: arguments[key] for key in shared_names if key in arguments}
+        array = {key: value for key, value in arguments.items() if key not in shared_names}
+        return shared, array
+
+    @staticmethod
+    def _actuator_arguments_key(arguments: dict[str, Any]) -> tuple[tuple[str, Any], ...]:
+        """Build a stable hashable key for shared actuator arguments."""
+
+        def make_hashable(value: Any) -> Any:
+            return tuple(value) if isinstance(value, list) else value
+
+        return tuple(sorted((key, make_hashable(value)) for key, value in arguments.items()))
+
+    def _author_actuator_joint_configurations(
+        self,
+        method_name: str,
+        controller_class: type[Controller],
+        resolved_controller: dict[str, Any],
+        output_indices: Sequence[int],
+        configurations: Sequence[Controller.JointConfiguration],
+    ) -> None:
+        """Author resolved controller properties on output joints."""
+        joint_fields = (
+            ("target_ke", "joint_target_ke"),
+            ("target_kd", "joint_target_kd"),
+            ("dry_friction", "joint_friction"),
+            ("viscous_friction", "joint_damping"),
+        )
+        model_path = resolved_controller.get("model_path", "<unknown>")
+        for output_index, configuration in zip(output_indices, configurations, strict=True):
+            changes = []
+            gains_authored = False
+            for field_name, builder_name in joint_fields:
+                value = getattr(configuration, field_name)
+                if value is None:
+                    continue
+                values = getattr(self, builder_name)
+                old_value = values[output_index]
+                values[output_index] = value
+                gains_authored |= field_name in ("target_ke", "target_kd")
+                if not math.isclose(old_value, value, rel_tol=1.0e-9, abs_tol=1.0e-12):
+                    changes.append(f"{builder_name}: {old_value} -> {value}")
+
+            if gains_authored:
+                old_mode = self.joint_target_mode[output_index]
+                new_mode = int(
+                    JointTargetMode.from_gains(
+                        self.joint_target_ke[output_index], self.joint_target_kd[output_index], has_drive=True
+                    )
+                )
+                self.joint_target_mode[output_index] = new_mode
+                if old_mode != new_mode:
+                    changes.append(f"joint_target_mode: {old_mode} -> {new_mode}")
+
+            if changes:
+                warnings.warn(
+                    f"{method_name}: {controller_class.__name__} metadata from '{model_path}' "
+                    f"overwrote target DOF {output_index}: {', '.join(changes)}",
+                    stacklevel=4,
+                )
 
     def _stack_args_to_arrays(
         self,
@@ -4018,6 +4186,8 @@ class ModelBuilder:
                     controller_shared_kwargs=sub_entry.controller_shared_kwargs,
                     indices=[],
                     pos_indices=[],
+                    input_indices=[],
+                    input_pos_indices=[],
                     controller_args=[],
                     delay_args=[],
                     clamping_args=[],
@@ -4027,6 +4197,10 @@ class ModelBuilder:
                 entry.indices.append(idx + start_joint_dof_idx)
             for idx in sub_entry.pos_indices:
                 entry.pos_indices.append(idx + start_joint_coord_idx)
+            for idx in sub_entry.input_indices:
+                entry.input_indices.append(idx + start_joint_dof_idx)
+            for idx in sub_entry.input_pos_indices:
+                entry.input_pos_indices.append(idx + start_joint_coord_idx)
             entry.controller_args.extend(sub_entry.controller_args)
             entry.delay_args.extend(sub_entry.delay_args)
             entry.clamping_args.extend(sub_entry.clamping_args)
@@ -11569,6 +11743,19 @@ class ModelBuilder:
                 pos_indices_arg = None
                 if entry.pos_indices != entry.indices:
                     pos_indices_arg = self._build_index_array(entry.pos_indices, device)
+                pos_indices = pos_indices_arg if pos_indices_arg is not None else indices
+
+                input_indices = (
+                    indices
+                    if entry.input_indices == entry.indices
+                    else self._build_index_array(entry.input_indices, device)
+                )
+                if entry.input_pos_indices == entry.pos_indices:
+                    input_pos_indices = pos_indices
+                elif entry.input_pos_indices == entry.input_indices:
+                    input_pos_indices = input_indices
+                else:
+                    input_pos_indices = self._build_index_array(entry.input_pos_indices, device)
 
                 # Build controller from stacked per-DOF arrays + shared kwargs
                 ctrl_arrays = self._stack_args_to_arrays(
@@ -11596,6 +11783,7 @@ class ModelBuilder:
                 target_pos_indices_arg = (
                     pos_indices_arg if (pos_indices_arg is not None and m.use_coord_layout_targets) else indices
                 )
+                input_target_pos_indices = input_pos_indices if m.use_coord_layout_targets else input_indices
                 actuator = Actuator(
                     indices=indices,
                     controller=controller,
@@ -11603,6 +11791,9 @@ class ModelBuilder:
                     clamping=clamping_objs if clamping_objs else None,
                     pos_indices=pos_indices_arg,
                     target_pos_indices=target_pos_indices_arg,
+                    input_indices=input_indices,
+                    input_pos_indices=input_pos_indices,
+                    input_target_pos_indices=input_target_pos_indices,
                     control_target_pos_attr="joint_target_q",
                     control_target_vel_attr="joint_target_qd",
                     requires_grad=requires_grad,
