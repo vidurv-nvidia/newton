@@ -230,8 +230,14 @@ Construct it with ``ControllerNeuralGRU(model_path, mapping_index=None)``.
 ``mapping_index`` selects an entry in the archive's ordered
 ``joint_mappings`` list and is required when the archive contains more than
 one mapping.  The selected mapping defines the ordered input and output joint
-axes; mappings may describe SISO, MISO, or MIMO applications of the same
-weights.
+axes.  Four layouts are supported:
+
+* **SISO** uses one single-input, single-output mapping.
+* **Shared SISO** stores multiple single-input, single-output mappings in one
+  artifact.  Every mapping uses the same weights and normalization statistics
+  while retaining independent recurrent state.
+* **MISO** uses one multi-input, single-output mapping.
+* **MIMO** uses one multi-input, multi-output mapping.
 
 At each control step, the controller assembles feature blocks in the exact
 ``input_columns`` order stored in metadata.  ``position``,
@@ -288,11 +294,11 @@ For example, register a grouped MISO mapping with:
    )
 
 Repeat compatible registrations with the same artifact and the corresponding
-``mapping_index`` for shared SISO.  They are batched into one network forward,
+``mapping_index`` for Shared SISO.  They are batched into one network forward,
 with a separate recurrent row (hidden state and previous torque) for every
 mapping application.  The current USD actuator importer registers one scalar
 target and does not author ``mapping_index``.  Consequently, USD supports only
-a single-mapping SISO GRU archive; shared SISO, MISO, and MIMO archives must be
+a single-mapping SISO GRU archive; Shared SISO, MISO, and MIMO archives must be
 registered with :meth:`~newton.ModelBuilder.add_actuator_group`.
 
 Differentiability and Graph Capture
