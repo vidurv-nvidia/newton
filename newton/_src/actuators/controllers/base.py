@@ -77,27 +77,6 @@ class Controller:
         raise NotImplementedError(f"{cls.__name__} must implement resolve_arguments")
 
     @classmethod
-    def resolve_joint_configuration(
-        cls,
-        args: dict[str, Any],
-        delay_steps: int | None = None,
-    ) -> JointConfiguration | None:
-        """Return joint properties required by resolved controller arguments.
-
-        This optional build-time hook is called while the target DOF is still
-        mutable. Controllers that do not require joint configuration changes
-        return None.
-
-        Args:
-            args: Arguments returned by resolve_arguments.
-            delay_steps: Authored external actuator delay, if any.
-
-        Returns:
-            Required joint configuration, or None.
-        """
-        return None
-
-    @classmethod
     def resolve_joint_configurations(
         cls,
         args: dict[str, Any],
@@ -106,9 +85,9 @@ class Controller:
     ) -> tuple[JointConfiguration, ...] | None:
         """Return ordered joint properties for an actuator output group.
 
-        The default repeats the scalar configuration returned by
-        :meth:`resolve_joint_configuration`. Controllers with slot-specific
-        output properties may override this hook.
+        This optional build-time hook is called while the output DOFs are still
+        mutable. Controllers that do not require joint configuration changes
+        return ``None``.
 
         Args:
             args: Arguments returned by :meth:`resolve_arguments`.
@@ -118,10 +97,7 @@ class Controller:
         Returns:
             One configuration per output DOF, or ``None``.
         """
-        configuration = cls.resolve_joint_configuration(args, delay_steps)
-        if configuration is None:
-            return None
-        return (configuration,) * output_count
+        return None
 
     @classmethod
     def validate_resolved_group(

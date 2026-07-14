@@ -525,21 +525,6 @@ class ControllerNeuralGRU(Controller):
             for output_slot, pd_slot in enumerate(pd_slots)
         )
 
-    @classmethod
-    def resolve_joint_configuration(
-        cls,
-        args: dict[str, Any],
-        delay_steps: int | None = None,
-    ) -> Controller.JointConfiguration:
-        model_path = args["model_path"]
-        metadata = _parse_metadata(load_metadata(model_path), model_path)
-        if metadata.input_width != 1 or metadata.output_width != 1:
-            raise ValueError(
-                "coupled schema-v3 GRUs require ModelBuilder.add_actuator_group with separate input/output indices"
-            )
-        configurations = cls.resolve_joint_configurations(args, output_count=1, delay_steps=delay_steps)
-        return configurations[0]
-
     def __init__(self, model_path: str, mapping_index: int | wp.array | None = None):
         import torch
 
