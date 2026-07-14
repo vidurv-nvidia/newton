@@ -94,6 +94,7 @@ class Actuator:
         control_output_attr: str = "joint_f",
         control_computed_output_attr: str | None = None,
         requires_grad: bool = False,
+        *,
         input_indices: wp.array[wp.uint32] | None = None,
         input_pos_indices: wp.array[wp.uint32] | None = None,
         input_target_pos_indices: wp.array[wp.uint32] | None = None,
@@ -101,8 +102,8 @@ class Actuator:
         """Initialize actuator.
 
         Args:
-            indices: DOF indices into velocity-shaped arrays (velocities,
-                velocity targets, feedforward, effort output). Shape ``(N,)``.
+            indices: Output-axis DOF indices used for clamping and effort
+                output. Shape ``(N,)``.
             controller: Controller that computes raw effort.
             delay: Optional Delay instance for input delay.
             clamping: List of Clamping objects (post-controller effort bounds).
@@ -136,15 +137,14 @@ class Actuator:
             requires_grad: Allocate intermediate arrays with gradient support
                 for differentiable simulation.
             input_indices: DOF indices into velocity-shaped state and target
-                arrays read by the controller. Defaults to *indices*.
+                arrays read by the controller. Must be supplied together with
+                *input_pos_indices* and *input_target_pos_indices*. Omit all
+                three to reuse the output axis. ModelBuilder supplies them for
+                grouped controllers.
             input_pos_indices: Indices into coordinate-shaped position arrays
-                read by the controller. Defaults to *pos_indices* when
-                *input_indices* is omitted, otherwise to *input_indices*.
+                read by the controller.
             input_target_pos_indices: Indices into position-target arrays read
-                by the controller. Defaults to *target_pos_indices* when
-                *input_indices* and *input_pos_indices* are omitted. Otherwise,
-                it follows the configured target layout using
-                *input_pos_indices* or *input_indices*.
+                by the controller.
         """
         self.indices = indices
         self.pos_indices = pos_indices if pos_indices is not None else indices
@@ -165,22 +165,17 @@ class Actuator:
             raise ValueError(
                 f"effort_indices shape {self.effort_indices.shape} must match indices shape {indices.shape}"
             )
-        self.input_indices = input_indices if input_indices is not None else indices
-        self.input_pos_indices = (
-            input_pos_indices
-            if input_pos_indices is not None
-            else (self.pos_indices if input_indices is None else self.input_indices)
-        )
-        if input_target_pos_indices is not None:
-            self.input_target_pos_indices = input_target_pos_indices
-        elif input_indices is None and input_pos_indices is None:
+        input_axis = (input_indices, input_pos_indices, input_target_pos_indices)
+        if any(value is None for value in input_axis) and any(value is not None for value in input_axis):
+            raise ValueError("input_indices, input_pos_indices, and input_target_pos_indices must be provided together")
+        if input_indices is None:
+            self.input_indices = indices
+            self.input_pos_indices = self.pos_indices
             self.input_target_pos_indices = self.target_pos_indices
         else:
-            import newton  # noqa: PLC0415
-
-            self.input_target_pos_indices = (
-                self.input_pos_indices if newton.use_coord_layout_targets else self.input_indices
-            )
+            self.input_indices = input_indices
+            self.input_pos_indices = input_pos_indices
+            self.input_target_pos_indices = input_target_pos_indices
         if self.input_pos_indices.shape != self.input_indices.shape:
             raise ValueError(
                 f"input_pos_indices shape {self.input_pos_indices.shape} "
@@ -197,6 +192,8 @@ class Actuator:
         self.num_actuators = len(indices)
         self.num_inputs = len(self.input_indices)
         if delay is not None:
+            if not controller.supports_external_delay:
+                raise ValueError(f"{type(controller).__name__} cannot be combined with a Newton Delay")
             if len(delay.delay_steps) != self.num_inputs:
                 raise ValueError(
                     f"Delay delay_steps length {len(delay.delay_steps)} must match "
@@ -205,7 +202,6 @@ class Actuator:
             if self.num_inputs != self.num_actuators:
                 raise ValueError("Actuator Delay requires equal input and output counts")
         controller.validate_io(self.num_inputs, self.num_actuators)
-        controller.validate_delay(delay)
 
         self.state_pos_attr = state_pos_attr
         self.state_vel_attr = state_vel_attr

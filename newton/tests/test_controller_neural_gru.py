@@ -18,7 +18,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton.actuators import Actuator, ClampingMaxEffort, ControllerNeuralGRU
+from newton.actuators import Actuator, ClampingMaxEffort, ControllerNeuralGRU, Delay
 
 _HAS_TORCH = importlib.util.find_spec("torch") is not None
 
@@ -293,6 +293,65 @@ class TestControllerNeuralGRU(unittest.TestCase):
             ControllerNeuralGRU.validate_resolved_group(args, [4, 5, 6], [5])
         with self.assertRaisesRegex(ValueError, "requires 3 input and 1 output"):
             ControllerNeuralGRU.validate_resolved_group(args, [4, 5], [5])
+
+    def test_actuator_input_axis_is_all_or_none(self):
+        """Reject partial low-level input-axis wiring."""
+        path = self._save(_metadata())
+        indices = self._arrays([0], dtype=wp.uint32)
+        names = ("input_indices", "input_pos_indices", "input_target_pos_indices")
+
+        for mask in range(1, 7):
+            kwargs = {name: indices for bit, name in enumerate(names) if mask & (1 << bit)}
+            with self.subTest(mask=mask), self.assertRaisesRegex(ValueError, "must be provided together"):
+                Actuator(indices, ControllerNeuralGRU(path), **kwargs)
+
+    def test_actuator_routes_explicit_miso_input_axis(self):
+        """Read an explicit two-joint input axis and write one output effort."""
+        metadata = _metadata(("shoulder", "elbow"), ("elbow",), features=("position",))
+        controller = ControllerNeuralGRU(self._save(metadata, weights=np.array([[1.0, 10.0]], dtype=np.float32)))
+        actuator = Actuator(
+            indices=self._arrays([1], dtype=wp.uint32),
+            controller=controller,
+            input_indices=self._arrays([0, 1], dtype=wp.uint32),
+            input_pos_indices=self._arrays([2, 0], dtype=wp.uint32),
+            input_target_pos_indices=self._arrays([0, 1], dtype=wp.uint32),
+            control_target_pos_attr="joint_target_q",
+            control_target_vel_attr="joint_target_qd",
+        )
+        sim_state = types.SimpleNamespace(
+            joint_q=self._arrays([3.0, 99.0, 2.0]),
+            joint_qd=self._arrays([0.0, 0.0]),
+        )
+        sim_control = types.SimpleNamespace(
+            joint_target_q=self._arrays([0.0, 0.0]),
+            joint_target_qd=self._arrays([0.0, 0.0]),
+            joint_act=self._arrays([0.0, 0.0]),
+            joint_f=self._arrays([0.0, 0.0]),
+        )
+
+        actuator.step(sim_state, sim_control, actuator.state(), actuator.state(), 0.002)
+
+        np.testing.assert_allclose(sim_control.joint_f.numpy(), [0.0, 32.0])
+
+    def test_gru_rejects_external_delay(self):
+        """Reject external Delay through both builder and direct construction."""
+        path = self._save(_metadata())
+        builder = newton.ModelBuilder()
+        link = builder.add_link()
+        joint = builder.add_joint_revolute(parent=-1, child=link, axis=newton.Axis.Z)
+        dof = builder.joint_qd_start[joint]
+        with self.assertRaisesRegex(ValueError, "cannot be combined with a Newton Delay"):
+            builder.add_actuator(
+                ControllerNeuralGRU,
+                index=dof,
+                model_path=path,
+                delay_steps=1,
+            )
+
+        indices = self._arrays([0], dtype=wp.uint32)
+        delay = Delay(self._arrays([1], dtype=wp.int32), max_delay=1)
+        with self.assertRaisesRegex(ValueError, "cannot be combined with a Newton Delay"):
+            Actuator(indices, ControllerNeuralGRU(path), delay=delay)
 
     def test_miso_feature_major_assembly_includes_dynamic_bias(self):
         """Assemble all feature blocks in Anchor order for a shuffled 3-to-1 mapping."""

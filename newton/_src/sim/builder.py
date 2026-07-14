@@ -2119,6 +2119,8 @@ class ModelBuilder:
             raise ValueError("input_pos_indices must match input_indices length")
         if len(output_positions) != len(output_dofs):
             raise ValueError("output_pos_indices must match output_indices length")
+        if delay_steps is not None and not controller_class.supports_external_delay:
+            raise ValueError(f"{controller_class.__name__} cannot be combined with a Newton Delay")
         if delay_steps is not None and len(input_dofs) != len(output_dofs):
             raise ValueError(f"{method_name} does not support Delay when input and output widths differ")
 
@@ -2132,9 +2134,7 @@ class ModelBuilder:
             )
 
         controller_class.validate_resolved_group(resolved_controller, input_dofs, output_dofs)
-        joint_configurations = controller_class.resolve_joint_configurations(
-            resolved_controller, len(output_dofs), delay_steps
-        )
+        joint_configurations = controller_class.resolve_joint_configurations(resolved_controller, len(output_dofs))
         if joint_configurations is not None:
             if len(joint_configurations) != len(output_dofs):
                 raise ValueError(

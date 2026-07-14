@@ -61,6 +61,9 @@ class Controller:
 
     SHARED_PARAMS: ClassVar[set[str]] = set()
 
+    supports_external_delay: ClassVar[bool] = True
+    """Whether the controller can be composed with a Newton :class:`Delay`."""
+
     requires_dynamic_bias: bool = False
     """Whether :class:`Actuator` should pass ``dynamic_bias`` to :meth:`compute`."""
 
@@ -81,7 +84,6 @@ class Controller:
         cls,
         args: dict[str, Any],
         output_count: int,
-        delay_steps: int | None = None,
     ) -> tuple[JointConfiguration, ...] | None:
         """Return ordered joint properties for an actuator output group.
 
@@ -92,7 +94,6 @@ class Controller:
         Args:
             args: Arguments returned by :meth:`resolve_arguments`.
             output_count: Number of output DOFs in the authored group.
-            delay_steps: Authored external actuator delay, if any.
 
         Returns:
             One configuration per output DOF, or ``None``.
@@ -144,16 +145,6 @@ class Controller:
                 f"{type(self).__name__} requires equal input and output counts; "
                 f"got {input_count} inputs and {output_count} outputs"
             )
-
-    def validate_delay(self, delay: Any | None) -> None:
-        """Validate an optional runtime Delay component.
-
-        Controllers whose artifact contract constrains delay may override this
-        hook. The default accepts either presence or absence of delay.
-
-        Args:
-            delay: Runtime Delay component, or ``None``.
-        """
 
     def compute(
         self,

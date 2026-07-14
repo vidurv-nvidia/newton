@@ -387,11 +387,6 @@ def _resolve_group_mapping_indices(
     return tuple(mapping_indices)
 
 
-def _validate_delay(delay_steps: int | None) -> None:
-    if delay_steps is not None:
-        raise ValueError("GRU models with learned delay cannot be combined with a Newton Delay")
-
-
 class ControllerNeuralGRU(Controller):
     """Stateful GRU controller with an embedded runtime contract.
 
@@ -415,6 +410,7 @@ class ControllerNeuralGRU(Controller):
     """
 
     SHARED_PARAMS: ClassVar[set[str]] = {"model_path"}
+    supports_external_delay: ClassVar[bool] = False
 
     @dataclass
     class State(Controller.State):
@@ -493,13 +489,11 @@ class ControllerNeuralGRU(Controller):
         cls,
         args: dict[str, Any],
         output_count: int,
-        delay_steps: int | None = None,
     ) -> tuple[Controller.JointConfiguration, ...] | None:
         """Resolve one joint configuration per selected mapping output."""
         model_path = args["model_path"]
         metadata = _parse_metadata(load_metadata(model_path), model_path)
         mapping_index = _resolve_mapping_index(metadata, args.get("mapping_index"))
-        _validate_delay(delay_steps)
         if output_count != metadata.output_width:
             raise ValueError(
                 f"ControllerNeuralGRU expected {metadata.output_width} output configuration(s) "
@@ -637,10 +631,6 @@ class ControllerNeuralGRU(Controller):
                 f"ControllerNeuralGRU input/output counts describe different group counts: "
                 f"{input_groups} input group(s) and {output_groups} output group(s)"
             )
-
-    def validate_delay(self, delay: Any | None) -> None:
-        """Reject Newton delays because delay is learned by the network."""
-        _validate_delay(None if delay is None else 0)
 
     def _output_group_count(self, output_count: int) -> int:
         if output_count % self._output_width != 0:
