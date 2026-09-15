@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import functools
 import warnings
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, make_dataclass
 from typing import Any
 
 import numpy as np
@@ -13,7 +15,6 @@ import warp as wp
 from .clamping.base import ClampingBase
 from .delay import Delay
 from .drives.base import DriveBase
-from .drives.drive_neural_gru import DriveNeuralGRU
 from .effort_mode_explicit import _EffortModeExplicit
 from .effort_mode_implicit import ImplicitOptions, ResponseOracle, _EffortModeImplicit
 
@@ -41,6 +42,88 @@ def _scatter_add_kernel(
     output[idx] = output[idx] + forces[i]
     if computed_output:
         computed_output[idx] = computed_output[idx] + computed_forces[i]
+
+
+_MISSING = object()
+
+
+def _get_attribute(source: Any, name: str, default: Any = _MISSING) -> Any:
+    """Read *name* from an object or a mapping, like :func:`getattr`.
+
+    Raises:
+        AttributeError: *name* is absent and no *default* was given.
+    """
+    value = source.get(name, default) if isinstance(source, Mapping) else getattr(source, name, default)
+    if value is _MISSING:
+        raise AttributeError(f"{type(source).__name__} object has no attribute '{name}'")
+    return value
+
+
+def _check_length(owner: str, name: str, array: Any, minimum: int) -> None:
+    """Reject an array too short for the indices that gather from it.
+
+    Raises:
+        ValueError: *array* is shorter than *minimum*.
+    """
+    if len(array) < minimum:
+        raise ValueError(f"{owner}: '{name}' has length {len(array)}; the actuator's indices need at least {minimum}.")
+
+
+def _require_array(source: Any, name: str) -> Any:
+    """Read *name* from *source* and require an array.
+
+    Raises:
+        AttributeError: *name* is absent.
+        ValueError: *name* is present but unset.
+    """
+    value = _get_attribute(source, name)
+    if value is None:
+        raise ValueError(f"'{name}' is None; assign it before stepping the actuator.")
+    return value
+
+
+def _select_custom_inputs(
+    owner: str,
+    sim_state: Any,
+    sim_control: Any,
+    declared: tuple[tuple[str, str], ...],
+    length: int,
+) -> dict[str, Any]:
+    """Read the ``(source, attribute)`` pairs in *declared*, keyed by attribute.
+
+    Raises:
+        ValueError: An array is missing or is not a Warp array.
+    """
+    if not declared:
+        return {}
+
+    objects = {"sim_state": sim_state, "sim_control": sim_control}
+    selected: dict[str, Any] = {}
+    for source, attribute in declared:
+        if source not in objects:
+            raise ValueError(f"{owner} declared the input source '{source}'; expected 'sim_state' or 'sim_control'.")
+        value = _get_attribute(objects[source], attribute, None)
+        if value is None:
+            raise ValueError(
+                f"{owner} requires the array '{attribute}', but {source} does not provide it. "
+                f"Pass a {source} of your own that carries '{attribute}' alongside the usual arrays."
+            )
+        if not isinstance(value, (wp.array, wp.indexedarray, wp.fabricarray)):
+            raise ValueError(f"{owner} input '{source}.{attribute}' must be a wp.array; got {type(value).__name__}.")
+        if len(value) != length:
+            raise ValueError(
+                f"{owner} input '{source}.{attribute}' has length {len(value)}; expected {length}, matching '{source}'."
+            )
+        selected[attribute] = value
+    return selected
+
+
+@functools.cache
+def _input_container_class(name: str, fields: tuple[str, ...]) -> type:
+    """Build a slotted dataclass exposing exactly *fields*, each defaulting to ``None``."""
+    cls = make_dataclass(name, [(field, Any, None) for field in fields], slots=True)
+    cls.__doc__ = f"Arrays an actuator reads from ``{name}``: {', '.join(fields)}."
+    return cls
 
 
 class Actuator:
@@ -203,6 +286,10 @@ class Actuator:
 
             self.target_pos_indices = self.pos_indices if newton.use_coord_layout_targets else indices
         self.effort_indices = effort_indices if effort_indices is not None else indices
+        self._min_pos_len = int(self.pos_indices.numpy().max()) + 1
+        self._min_vel_len = int(self.indices.numpy().max()) + 1
+        self._min_target_pos_len = int(self.target_pos_indices.numpy().max()) + 1
+        self._min_effort_len = int(self.effort_indices.numpy().max()) + 1
         if self.pos_indices.shape != indices.shape:
             raise ValueError(f"pos_indices shape {self.pos_indices.shape} must match indices shape {indices.shape}")
         if self.target_pos_indices.shape != indices.shape:
@@ -246,6 +333,32 @@ class Actuator:
             clamp.finalize(self.device, self.num_actuators)
 
         self._effort_mode = _EffortModeExplicit(drive, self.clamping, self.device)
+
+    def sim_state(self) -> Any:
+        """Return an empty container with the fields this actuator reads from ``sim_state``.
+
+        Every field is ``None`` until assigned; the caller owns the arrays.
+        Fields hold references, so re-point them whenever the simulation swaps
+        states. Re-pointing has no effect on an already-captured CUDA graph,
+        which holds the pointers bound at capture time.
+
+        Returns:
+            Container whose slots are the required ``sim_state`` attributes.
+        """
+        fields = self._required_attributes.get("sim_state", ())
+        return _input_container_class("sim_state", fields)()
+
+    def sim_control(self) -> Any:
+        """Return an empty container with the fields this actuator reads from ``sim_control``.
+
+        Returns:
+            Container whose slots are the required ``sim_control`` attributes.
+
+        Note:
+            Leaving the feedforward field unassigned means no feedforward term.
+        """
+        fields = self._required_attributes.get("sim_control", ())
+        return _input_container_class("sim_control", fields)()
 
     @property
     def controller(self) -> DriveBase:
@@ -293,6 +406,11 @@ class Actuator:
                 "and the neural drives open their own wp.Tape, which cannot nest inside "
                 "an outer tape. Build the Actuator with requires_grad=False."
             )
+        if self.drive.custom_inputs and type(self.drive).prepare_implicit is DriveBase.prepare_implicit:
+            raise NotImplementedError(
+                f"{type(self.drive).__name__} declares custom inputs but does not override prepare_implicit, "
+                "so the implicit solve would ignore them."
+            )
         self._effort_mode = _EffortModeImplicit(
             self.drive,
             self.clamping,
@@ -324,6 +442,34 @@ class Actuator:
             drive_state=(self.drive.state(self.num_actuators, self.device) if self.drive.is_stateful() else None),
         )
 
+    @property
+    def _required_attributes(self) -> dict[str, tuple[str, ...]]:
+        """Attributes this actuator reads, keyed by ``sim_state`` or ``sim_control``.
+
+        Covers the standard arrays and the drive's custom inputs.
+        """
+        state_attrs = [self.state_pos_attr, self.state_vel_attr]
+        control_attrs = [
+            self.control_target_pos_attr,
+            self.control_target_vel_attr,
+            self.control_feedforward_attr,
+            self.control_output_attr,
+            self.control_computed_output_attr,
+        ]
+        required = {
+            "sim_state": state_attrs,
+            "sim_control": [a for a in control_attrs if a is not None],
+        }
+        for source, attribute in self.drive.custom_inputs:
+            names = required.setdefault(source, [])
+            if attribute in names:
+                raise ValueError(
+                    f"{type(self.drive).__name__} custom input '{attribute}' collides with an array the "
+                    f"actuator already reads from {source}."
+                )
+            names.append(attribute)
+        return {source: tuple(dict.fromkeys(names)) for source, names in required.items() if names}
+
     def step(
         self,
         sim_state: Any,
@@ -349,8 +495,13 @@ class Actuator:
            buffer write (push current targets into ``next_state``).
 
         Args:
-            sim_state: Simulation state with position/velocity arrays.
-            sim_control: Control structure with target/output arrays.
+            sim_state: Object or mapping carrying the arrays named by
+                :attr:`state_pos_attr` and :attr:`state_vel_attr`, plus the
+                actuator's custom inputs declared for this source. Build one
+                with :meth:`sim_state`.
+            sim_control: Object or mapping carrying the target and output
+                arrays, plus the actuator's custom inputs declared for this
+                source. Build one with :meth:`sim_control`.
             current_act_state: Current composed state (None if stateless).
             next_act_state: Next composed state (None if stateless).
             dt: Timestep [s].
@@ -360,14 +511,23 @@ class Actuator:
                 "Stateful actuator requires both current_act_state and next_act_state; create them via actuator.state()"
             )
 
-        positions = getattr(sim_state, self.state_pos_attr)
-        velocities = getattr(sim_state, self.state_vel_attr)
+        owner = type(self).__name__
+        positions = _require_array(sim_state, self.state_pos_attr)
+        velocities = _require_array(sim_state, self.state_vel_attr)
+        _check_length(owner, self.state_pos_attr, positions, self._min_pos_len)
+        _check_length(owner, self.state_vel_attr, velocities, self._min_vel_len)
 
-        orig_target_pos = getattr(sim_control, self.control_target_pos_attr)
-        orig_target_vel = getattr(sim_control, self.control_target_vel_attr)
+        orig_target_pos = _require_array(sim_control, self.control_target_pos_attr)
+        orig_target_vel = _require_array(sim_control, self.control_target_vel_attr)
+        if self.delay is None:
+            _check_length(owner, self.control_target_pos_attr, orig_target_pos, self._min_target_pos_len)
+            _check_length(owner, self.control_target_vel_attr, orig_target_vel, self._min_vel_len)
+
         orig_feedforward = None
         if self.control_feedforward_attr is not None:
-            orig_feedforward = getattr(sim_control, self.control_feedforward_attr, None)
+            orig_feedforward = _get_attribute(sim_control, self.control_feedforward_attr, None)
+            if orig_feedforward is not None and self.delay is None:
+                _check_length(owner, self.control_feedforward_attr, orig_feedforward, self._min_vel_len)
 
         target_pos = orig_target_pos
         target_vel = orig_target_vel
@@ -390,8 +550,9 @@ class Actuator:
 
         # --- 2+3. Effort mode: compute raw effort and clamp ---
         drive_state = current_act_state.drive_state if current_act_state else None
-        if isinstance(self.drive, DriveNeuralGRU) and self.drive._uses_bias_force:
-            self.drive._bound_bias_force = sim_state.mujoco.qfrc_bias
+        custom_inputs = _select_custom_inputs(
+            type(self.drive).__name__, sim_state, sim_control, self.drive.custom_inputs, len(velocities)
+        )
         output_forces = self._effort_mode.compute_force(
             sim_state,
             positions,
@@ -407,16 +568,19 @@ class Actuator:
             self._applied_forces,
             drive_state,
             dt,
+            custom_inputs,
         )
 
         # --- 4. Scatter-add to output ---
-        applied_output = getattr(sim_control, self.control_output_attr)
+        applied_output = _require_array(sim_control, self.control_output_attr)
+        _check_length(owner, self.control_output_attr, applied_output, self._min_effort_len)
         computed_output = None
         if (
             self.control_computed_output_attr is not None
             and self.control_computed_output_attr != self.control_output_attr
         ):
-            computed_output = getattr(sim_control, self.control_computed_output_attr)
+            computed_output = _require_array(sim_control, self.control_computed_output_attr)
+            _check_length(owner, self.control_computed_output_attr, computed_output, self._min_effort_len)
         wp.launch(
             kernel=_scatter_add_kernel,
             dim=self.num_actuators,

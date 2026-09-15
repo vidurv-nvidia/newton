@@ -1,1 +1,1 @@
-Add experimental `DriveNeuralGRU` support for ONNX checkpoints evaluated with Warp-NN, optionally using caller-populated `state.mujoco.qfrc_bias` for generalized bias-force conditioning with stateful explicit inference.
+Add experimental `DriveNeuralGRU`, a stateful GRU actuator drive that reads an ONNX checkpoint and evaluates it with Warp-NN. Checkpoint metadata selects the network's input features by name and may mark one of them as an array the application supplies each step.

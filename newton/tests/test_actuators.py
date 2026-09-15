@@ -653,11 +653,21 @@ class TestDrivePID(unittest.TestCase):
 class TestDriveNeuralGRU(unittest.TestCase):
     """DriveNeuralGRU ONNX loading and Warp-NN inference."""
 
-    FEATURES = ("position", "position_error", "velocity", "dynamic_bias")
+    FEATURES = ("position", "position_error", "velocity", "bias_force")
+    ALL_FEATURES = (
+        "position",
+        "target_position",
+        "position_error",
+        "velocity",
+        "target_velocity",
+        "velocity_error",
+        "bias_force",
+    )
+    CUSTOM_INPUT = "bias_force"
     SAMPLE_DT = 0.02
 
     def setUp(self):
-        self.device = wp.get_device("cpu")
+        self.device = wp.get_device()
         self._tmp_dir = tempfile.mkdtemp()
         self._networks: dict[str, dict[str, Any]] = {}
 
@@ -668,11 +678,12 @@ class TestDriveNeuralGRU(unittest.TestCase):
         return {
             "model_type": "gru",
             "input_columns": list(self.FEATURES if input_columns is None else input_columns),
+            "custom_inputs": [self.CUSTOM_INPUT],
             "sample_dt_s": self.SAMPLE_DT,
             "normalization": {
                 "inputs": {
-                    "mean": dict(zip(self.FEATURES, (0.5, -0.25, 1.0, -2.0), strict=True)),
-                    "std": dict(zip(self.FEATURES, (2.0, 0.5, 4.0, 5.0), strict=True)),
+                    "mean": dict(zip(self.ALL_FEATURES, (0.5, 0.9, -0.25, 1.0, -1.5, 0.75, -2.0), strict=True)),
+                    "std": dict(zip(self.ALL_FEATURES, (2.0, 1.75, 0.5, 4.0, 3.0, 2.5, 5.0), strict=True)),
                 },
                 "targets": {"mean": {"torque": 7.0}, "std": {"torque": 3.0}},
             },
@@ -680,11 +691,14 @@ class TestDriveNeuralGRU(unittest.TestCase):
 
     def _save_gru(self, filename: str = "gru.onnx", metadata=None, **kwargs) -> str:
         path = os.path.join(self._tmp_dir, filename)
+        metadata = self._metadata() if metadata is None else metadata
+        input_columns = metadata.get("input_columns")
+        default_input_size = len(input_columns) if isinstance(input_columns, list) and input_columns else 4
         self._networks[path] = _build_gru_onnx(
             path,
-            input_size=kwargs.pop("input_size", 4),
+            input_size=kwargs.pop("input_size", default_input_size),
             hidden_size=kwargs.pop("hidden_size", 4),
-            metadata=self._metadata() if metadata is None else metadata,
+            metadata=metadata,
             **kwargs,
         )
         return path
@@ -700,38 +714,34 @@ class TestDriveNeuralGRU(unittest.TestCase):
         return path
 
     def _write_single_joint_gru_usd(self, model_path: str, filename: str) -> str:
-        from pxr import Sdf
+        """Write a single-joint GRU fixture using typed USD physics APIs."""
+        from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics
 
         stage_path = os.path.join(self._tmp_dir, filename)
         stage = Usd.Stage.CreateNew(stage_path)
-        world = stage.DefinePrim("/World", "Xform")
-        stage.SetDefaultPrim(world)
-        stage.DefinePrim("/World/PhysicsScene", "PhysicsScene")
+        world = UsdGeom.Xform.Define(stage, "/World")
+        stage.SetDefaultPrim(world.GetPrim())
+        UsdPhysics.Scene.Define(stage, "/World/PhysicsScene")
 
-        robot = stage.DefinePrim("/World/Robot", "Xform")
-        schemas = Sdf.TokenListOp()
-        schemas.prependedItems = ["PhysicsArticulationRootAPI"]
-        robot.SetMetadata("apiSchemas", schemas)
+        UsdGeom.Xform.Define(stage, "/World/Robot")
 
-        base = stage.DefinePrim("/World/Robot/Base", "Xform")
-        schemas = Sdf.TokenListOp()
-        schemas.prependedItems = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
-        base.SetMetadata("apiSchemas", schemas)
-        base.CreateAttribute("physics:mass", Sdf.ValueTypeNames.Float).Set(1.0)
-        base.CreateAttribute("physics:diagonalInertia", Sdf.ValueTypeNames.Float3).Set((0.01, 0.01, 0.01))
-        base.CreateAttribute("physics:kinematicEnabled", Sdf.ValueTypeNames.Bool).Set(True)
+        base = UsdGeom.Xform.Define(stage, "/World/Robot/Base")
+        base_rigid_body = UsdPhysics.RigidBodyAPI.Apply(base.GetPrim())
+        base_rigid_body.CreateKinematicEnabledAttr(True)
+        base_mass = UsdPhysics.MassAPI.Apply(base.GetPrim())
+        base_mass.CreateMassAttr(1.0)
+        base_mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.01, 0.01, 0.01))
 
-        link = stage.DefinePrim("/World/Robot/Link", "Xform")
-        schemas = Sdf.TokenListOp()
-        schemas.prependedItems = ["PhysicsRigidBodyAPI", "PhysicsMassAPI"]
-        link.SetMetadata("apiSchemas", schemas)
-        link.CreateAttribute("physics:mass", Sdf.ValueTypeNames.Float).Set(0.5)
-        link.CreateAttribute("physics:diagonalInertia", Sdf.ValueTypeNames.Float3).Set((0.005, 0.005, 0.005))
+        link = UsdGeom.Xform.Define(stage, "/World/Robot/Link")
+        UsdPhysics.RigidBodyAPI.Apply(link.GetPrim())
+        link_mass = UsdPhysics.MassAPI.Apply(link.GetPrim())
+        link_mass.CreateMassAttr(0.5)
+        link_mass.CreateDiagonalInertiaAttr(Gf.Vec3f(0.005, 0.005, 0.005))
 
-        joint = stage.DefinePrim("/World/Robot/Joint", "PhysicsRevoluteJoint")
-        joint.CreateRelationship("physics:body0").SetTargets([Sdf.Path("/World/Robot/Base")])
-        joint.CreateRelationship("physics:body1").SetTargets([Sdf.Path("/World/Robot/Link")])
-        joint.CreateAttribute("physics:axis", Sdf.ValueTypeNames.Token).Set("Z")
+        joint = UsdPhysics.RevoluteJoint.Define(stage, "/World/Robot/Joint")
+        joint.CreateBody0Rel().SetTargets([base.GetPath()])
+        joint.CreateBody1Rel().SetTargets([link.GetPath()])
+        joint.CreateAxisAttr("Z")
 
         actuator = stage.DefinePrim("/World/Robot/Actuator", "NewtonActuator")
         schemas = Sdf.TokenListOp()
@@ -751,6 +761,7 @@ class TestDriveNeuralGRU(unittest.TestCase):
         position = np.array([-1.0, 0.5, 2.0, -0.25, 1.25, -2.0], dtype=np.float32)
         velocity = np.array([0.1, -0.4, 0.7, 1.1, -1.3, 0.2], dtype=np.float32)
         target = np.array([1.0, -1.5, 0.2, 2.0, 0.5, -0.7], dtype=np.float32)
+        target_velocity = np.array([0.9, -1.7, 2.5, -0.2, 1.2, 3.4], dtype=np.float32)
         bias_force = np.array([3.0, -2.5, 0.0, 4.5, -1.0, 2.0], dtype=np.float32)
         actuator = Actuator(
             indices=wp.array(indices, dtype=wp.uint32, device=self.device),
@@ -758,14 +769,16 @@ class TestDriveNeuralGRU(unittest.TestCase):
             target_pos_indices=wp.array(target_indices, dtype=wp.uint32, device=self.device),
             drive=DriveNeuralGRU(model_path),
         )
+        # The caller builds sim_state: the usual state arrays plus whatever the
+        # drive named in DriveBase.custom_inputs.
         state = types.SimpleNamespace(
             joint_q=wp.array(position, dtype=wp.float32, device=self.device),
             joint_qd=wp.array(velocity, dtype=wp.float32, device=self.device),
-            mujoco=types.SimpleNamespace(qfrc_bias=wp.array(bias_force, dtype=wp.float32, device=self.device)),
+            bias_force=wp.array(bias_force, dtype=wp.float32, device=self.device),
         )
         control = types.SimpleNamespace(
             joint_target_q=wp.array(target, dtype=wp.float32, device=self.device),
-            joint_target_qd=wp.full(6, 123.0, dtype=wp.float32, device=self.device),
+            joint_target_qd=wp.array(target_velocity, dtype=wp.float32, device=self.device),
             joint_act=wp.full(6, 456.0, dtype=wp.float32, device=self.device),
             joint_f=wp.zeros(6, dtype=wp.float32, device=self.device),
         )
@@ -781,20 +794,31 @@ class TestDriveNeuralGRU(unittest.TestCase):
             position=position,
             velocity=velocity,
             target=target,
+            target_velocity=target_velocity,
+            target_vel_indices=indices,
             bias_force=bias_force,
             network=self._networks[model_path],
         )
 
-    def _expected(self, metadata, case, hidden=None):
+    def _expected(self, metadata, case, hidden=None, target_vel_indices=None):
         keys = metadata["input_columns"]
         stats = metadata["normalization"]["inputs"]
         position = case.position[case.pos_indices]
+        velocity = case.velocity[case.indices]
+        if target_vel_indices is None:
+            target_vel_indices = case.target_vel_indices
+        target_velocity = case.target_velocity[target_vel_indices]
         values = {
             "position": position,
+            "target_position": case.target[case.target_indices],
             "position_error": case.target[case.target_indices] - position,
-            "velocity": case.velocity[case.indices],
-            "dynamic_bias": case.bias_force[case.indices],
+            "velocity": velocity,
+            "target_velocity": target_velocity,
+            "velocity_error": target_velocity - velocity,
         }
+        # The caller-supplied column is keyed by whatever name the checkpoint chose.
+        for name in metadata.get("custom_inputs", ()):
+            values[name] = case.bias_force[case.indices]
         raw = np.stack(tuple(values[key] for key in keys), axis=1)
         means = np.array([stats["mean"][key] for key in keys], dtype=np.float32)
         stds = np.array([stats["std"][key] for key in keys], dtype=np.float32)
@@ -824,26 +848,33 @@ class TestDriveNeuralGRU(unittest.TestCase):
         case.actuator.step(case.state, case.control, case.state_a, case.state_b, dt=self.SAMPLE_DT)
         return case.control.joint_f.numpy()[case.indices], case.state_b.drive_state.hidden.numpy()
 
-    def _compute_direct(self, case, state, dt=SAMPLE_DT):
+    def _compute_direct(self, case, state, dt=SAMPLE_DT, target_vel_indices=None, feedforward=None):
         forces = wp.zeros(len(case.indices), dtype=wp.float32, device=self.device)
+        custom_inputs = {"bias_force": feedforward} if feedforward is not None else None
+        if target_vel_indices is None:
+            target_vel_indices = case.actuator.indices
+        elif not isinstance(target_vel_indices, wp.array):
+            target_vel_indices = wp.array(target_vel_indices, dtype=wp.uint32, device=self.device)
         case.actuator.drive.compute(
             case.state.joint_q,
             case.state.joint_qd,
             case.control.joint_target_q,
             case.control.joint_target_qd,
-            None,
+            feedforward,
             case.actuator.pos_indices,
             case.actuator.indices,
             case.actuator.target_pos_indices,
-            case.actuator.indices,
+            target_vel_indices,
             forces,
             state,
             dt,
             self.device,
+            custom_inputs,
         )
         return forces
 
     def test_scalar_vectorized_and_stacked_inference(self):
+        """Match a reference GRU for scalar, vectorized, and stacked-layer checkpoints."""
         for n, layers in ((1, 1), (3, 1), (3, 2)):
             with self.subTest(batch=n, layers=layers):
                 metadata = self._metadata()
@@ -859,7 +890,41 @@ class TestDriveNeuralGRU(unittest.TestCase):
                     np.delete(case.control.joint_f.numpy(), case.indices.astype(np.int64)), 0.0
                 )
 
+    def test_arbitrary_ordered_feature_subsets(self):
+        """Assemble network input for any ordered subset of the supported features."""
+        feature_sets = (
+            ("target_velocity",),
+            ("velocity_error", "position", "bias_force"),
+            ("target_position", "position_error"),
+            tuple(reversed(self.ALL_FEATURES)),
+        )
+        for index, features in enumerate(feature_sets):
+            with self.subTest(features=features):
+                metadata = self._metadata(features)
+                path = self._save_gru(f"feature_subset_{index}.onnx", metadata)
+                case = self._make_case(path, 3)
+
+                effort, hidden = self._step(case)
+                expected_effort, expected_hidden = self._expected(metadata, case)
+
+                np.testing.assert_allclose(effort, expected_effort, rtol=1e-5, atol=1e-6)
+                np.testing.assert_allclose(hidden, expected_hidden, rtol=1e-5, atol=1e-6)
+
+    def test_target_velocity_features_use_nonsequential_indices(self):
+        """Gather target-velocity features through the actuator's own target indices."""
+        features = ("target_velocity", "velocity_error")
+        metadata = self._metadata(features)
+        path = self._save_gru("target_velocity_indices.onnx", metadata)
+        case = self._make_case(path, 3)
+        target_vel_indices = np.array([5, 0, 2], dtype=np.uint32)
+
+        forces = self._compute_direct(case, case.state_a.drive_state, target_vel_indices=target_vel_indices)
+
+        expected, _ = self._expected(metadata, case, target_vel_indices=target_vel_indices)
+        np.testing.assert_allclose(forces.numpy(), expected, rtol=1e-5, atol=1e-6)
+
     def test_output_head_and_target_normalization(self):
+        """Denormalize the network output into physical torque using the target statistics."""
         metadata = self._metadata()
         metadata["normalization"]["targets"] = {"mean": {"torque": -3.0}, "std": {"torque": 4.0}}
         path = self._save_gru("linear_head.onnx", metadata, output_scale=1.0, apply_tanh=False)
@@ -870,6 +935,7 @@ class TestDriveNeuralGRU(unittest.TestCase):
         np.testing.assert_allclose(effort, self._expected(metadata, case)[0], rtol=1e-5, atol=1e-6)
 
     def test_gru_without_bias(self):
+        """Evaluate a checkpoint whose GRU nodes carry no bias initializer."""
         metadata = self._metadata(self.FEATURES[:-1])
         path = self._save_gru("no_gru_bias.onnx", metadata, input_size=3, include_bias=False)
         case = self._make_case(path, 2)
@@ -881,6 +947,7 @@ class TestDriveNeuralGRU(unittest.TestCase):
         np.testing.assert_allclose(hidden, expected_hidden, rtol=1e-5, atol=1e-6)
 
     def test_hidden_state_evolves_and_resets(self):
+        """Advance hidden state across steps and zero it on full and masked resets."""
         path = self._save_gru("state.onnx")
         case = self._make_case(path, 3)
         _, hidden_first = self._step(case)
@@ -897,47 +964,151 @@ class TestDriveNeuralGRU(unittest.TestCase):
         case.state_b.reset()
         np.testing.assert_array_equal(case.state_b.drive_state.hidden.numpy(), 0.0)
 
-    def test_dynamic_bias_is_optional(self):
+    def test_sim_state_swap_uses_current_supplied_arrays(self):
+        """Read the bias written for the current step, not the previous one."""
+        metadata = self._metadata(("position", "bias_force"))
+        path = self._save_gru("state_swap.onnx", metadata)
+        case = self._make_case(path, 3)
+        _, hidden_first = self._step(case)
+
+        case.state_a, case.state_b = case.state_b, case.state_a
+        case.position = np.array([0.2, -0.8, 1.7, 2.1, -1.4, 0.6], dtype=np.float32)
+        # Rebuilding sim_state means re-attaching the drive's named arrays too.
+        bias = case.state.bias_force
+        case.state = types.SimpleNamespace(
+            joint_q=wp.array(case.position, dtype=wp.float32, device=self.device),
+            joint_qd=wp.array(case.velocity, dtype=wp.float32, device=self.device),
+            bias_force=bias,
+        )
+        case.bias_force = np.array([-0.7, 1.6, 2.2, -3.5, 0.4, 4.1], dtype=np.float32)
+        bias.assign(case.bias_force)
+        expected_effort, expected_hidden = self._expected(metadata, case, hidden=hidden_first)
+
+        effort, hidden = self._step(case)
+
+        np.testing.assert_allclose(effort, expected_effort, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(hidden, expected_hidden, rtol=1e-5, atol=1e-6)
+
+    def test_delay_applies_to_targets_but_not_supplied_arrays(self):
+        """Delay target-derived features while sampling the bias from the current step."""
+        metadata = self._metadata(("position_error", "target_velocity", "bias_force"))
+        path = self._save_gru("delayed_targets.onnx", metadata)
+        case = self._make_case(path, 3)
+        case.actuator = Actuator(
+            indices=case.actuator.indices,
+            pos_indices=case.actuator.pos_indices,
+            target_pos_indices=case.actuator.target_pos_indices,
+            drive=DriveNeuralGRU(path),
+            delay=Delay(
+                delay_steps=wp.full(3, 1, dtype=wp.int32, device=self.device),
+                max_delay=1,
+            ),
+        )
+        case.state_a = case.actuator.state()
+        case.state_b = case.actuator.state()
+
+        delayed_target = case.target.copy()
+        delayed_target_velocity = case.target_velocity.copy()
+        _, hidden_first = self._step(case)
+        case.state_a, case.state_b = case.state_b, case.state_a
+
+        case.target = np.array([-3.0, 2.5, 1.4, -0.6, 3.2, -2.1], dtype=np.float32)
+        case.target_velocity = np.array([2.1, 0.4, -1.6, 3.3, -2.2, 0.8], dtype=np.float32)
+        case.bias_force = np.array([-4.0, 5.5, 1.2, -2.7, 3.1, 6.4], dtype=np.float32)
+        case.control.joint_target_q.assign(case.target)
+        case.control.joint_target_qd.assign(case.target_velocity)
+        case.state.bias_force.assign(case.bias_force)
+
+        expected_case = types.SimpleNamespace(**vars(case))
+        expected_case.target = delayed_target
+        expected_case.target_velocity = delayed_target_velocity
+        expected_effort, expected_hidden = self._expected(metadata, expected_case, hidden=hidden_first)
+
+        effort, hidden = self._step(case)
+
+        np.testing.assert_allclose(effort, expected_effort, rtol=1e-5, atol=1e-6)
+        np.testing.assert_allclose(hidden, expected_hidden, rtol=1e-5, atol=1e-6)
+
+    def test_supplied_array_features_are_optional(self):
+        """Evaluate a checkpoint that does not select the bias feature."""
         metadata = self._metadata(self.FEATURES[:-1])
         path = self._save_gru("no_bias.onnx", metadata, input_size=3)
         case = self._make_case(path, 2)
-        del case.state.mujoco
+        self.assertEqual(case.actuator.drive.custom_inputs, ())
 
         effort, _ = self._step(case)
 
         np.testing.assert_allclose(effort, self._expected(metadata, case)[0], rtol=1e-5, atol=1e-6)
 
-    def test_direct_compute_without_dynamic_bias(self):
-        metadata = self._metadata(self.FEATURES[:-1])
-        path = self._save_gru("direct.onnx", metadata, input_size=3)
-        case = self._make_case(path, 1)
+    def test_rejects_arrays_too_short_for_the_actuator_indices(self):
+        """Reject state, control and output arrays shorter than the actuator's indices reach."""
+        case = self._make_case(self._save_gru("short_arrays.onnx"), 3)
+        short = wp.zeros(3, dtype=wp.float32, device=self.device)
 
-        forces = self._compute_direct(case, case.state_a.drive_state)
+        with self.assertRaisesRegex(ValueError, r"'joint_q' has length 3"):
+            case.actuator.step(
+                {"joint_q": short, "joint_qd": case.state.joint_qd, "bias_force": case.state.bias_force},
+                case.control,
+                case.state_a,
+                case.state_b,
+                dt=self.SAMPLE_DT,
+            )
 
-        np.testing.assert_allclose(forces.numpy(), self._expected(metadata, case)[0], rtol=1e-5, atol=1e-6)
+        control = types.SimpleNamespace(**vars(case.control))
+        control.joint_f = short
+        with self.assertRaisesRegex(ValueError, r"'joint_f' has length 3"):
+            case.actuator.step(case.state, control, case.state_a, case.state_b, dt=self.SAMPLE_DT)
+
+    def test_reset_rejects_a_short_mask(self):
+        """Reject a reset mask shorter than the actuator count instead of reading past it."""
+        case = self._make_case(self._save_gru("short_mask.onnx"), 3)
+        with self.assertRaisesRegex(ValueError, "mask has length 1"):
+            case.state_a.drive_state.reset(wp.array([True], dtype=wp.bool, device=self.device))
+
+    def test_drive_rejects_a_second_actuator(self):
+        """Refuse to finalize one drive instance for a second, differently sized actuator."""
+        drive = DriveNeuralGRU(self._save_gru("shared_drive.onnx"))
+        Actuator(indices=wp.array([3, 1, 5], dtype=wp.uint32, device=self.device), drive=drive)
+        with self.assertRaisesRegex(RuntimeError, "already finalized"):
+            Actuator(indices=wp.array([0, 2], dtype=wp.uint32, device=self.device), drive=drive)
 
     def test_runtime_dt_and_state_contract(self):
+        """Reject a runtime dt that disagrees with sample_dt_s, and a missing drive state."""
         path = self._save_gru("contract.onnx")
         for dt in (None, self.SAMPLE_DT * 2.0):
             with self.subTest(dt=dt):
                 case = self._make_case(path, 1)
-                with self.assertRaisesRegex(ValueError, "dt|sample_dt_s"):
+                with self.assertRaisesRegex(ValueError, "sample_dt_s"):
                     case.actuator.step(case.state, case.control, case.state_a, case.state_b, dt=dt)
 
         case = self._make_case(path, 1)
-        with self.assertRaisesRegex(RuntimeError, "dynamic_bias|qfrc_bias"):
+        bare = types.SimpleNamespace(joint_q=case.state.joint_q, joint_qd=case.state.joint_qd)
+        with self.assertRaisesRegex(ValueError, "requires the array 'bias_force'"):
+            case.actuator.step(bare, case.control, case.state_a, case.state_b, dt=self.SAMPLE_DT)
+        wrong = types.SimpleNamespace(joint_q=case.state.joint_q, joint_qd=case.state.joint_qd, bias_force=[0.0] * 6)
+        with self.assertRaisesRegex(ValueError, "must be a wp.array"):
+            case.actuator.step(wrong, case.control, case.state_a, case.state_b, dt=self.SAMPLE_DT)
+        short = types.SimpleNamespace(
+            joint_q=case.state.joint_q,
+            joint_qd=case.state.joint_qd,
+            bias_force=wp.zeros(2, dtype=wp.float32, device=self.device),
+        )
+        with self.assertRaisesRegex(ValueError, "has length 2; expected 6"):
+            case.actuator.step(short, case.control, case.state_a, case.state_b, dt=self.SAMPLE_DT)
+        with self.assertRaisesRegex(RuntimeError, "no array was supplied"):
             self._compute_direct(case, case.state_a.drive_state)
         with self.assertRaisesRegex(RuntimeError, "compute must run"):
             case.actuator.drive.update_state(case.state_a.drive_state, case.state_b.drive_state)
+
+        metadata = self._metadata(self.FEATURES[:-1])
+        no_bias_case = self._make_case(self._save_gru("no_state.onnx", metadata, input_size=3), 1)
         with self.assertRaisesRegex(ValueError, "current drive state"):
-            metadata = self._metadata(self.FEATURES[:-1])
-            no_bias_path = self._save_gru("no_state.onnx", metadata, input_size=3)
-            no_bias_case = self._make_case(no_bias_path, 1)
             self._compute_direct(no_bias_case, None)
 
     def test_metadata_validation(self):
+        """Reject malformed input_columns and normalization metadata."""
         for index, input_columns in enumerate(
-            (["position", "velocity"], list(reversed(self.FEATURES)), "position", None)
+            ([], ["position", "position"], ["position", "unknown_feature"], "position", None)
         ):
             metadata = self._metadata()
             metadata["input_columns"] = input_columns
@@ -963,6 +1134,7 @@ class TestDriveNeuralGRU(unittest.TestCase):
                 DriveNeuralGRU(path)
 
     def test_checkpoint_and_network_validation(self):
+        """Reject missing files, non-ONNX paths, and shape-inconsistent weights."""
         with self.assertRaisesRegex(ValueError, "model_path"):
             DriveNeuralGRU.resolve_arguments({})
         with self.assertRaisesRegex(ValueError, "non-empty"):
@@ -986,7 +1158,8 @@ class TestDriveNeuralGRU(unittest.TestCase):
             DriveNeuralGRU(self._save_gru("vector_output.onnx", output_size=2))
 
     def test_rejects_unsupported_onnx_graphs(self):
-        _, _, helper, numpy_helper = _onnx_modules()
+        """Reject GRU graphs whose structure the drive cannot reconstruct faithfully."""
+        _, TensorProto, helper, numpy_helper = _onnx_modules()
         source = self._save_gru("valid_for_mutation.onnx")
 
         def node(model, op_type, index=0):
@@ -1015,6 +1188,34 @@ class TestDriveNeuralGRU(unittest.TestCase):
             set_attribute(model, "GRU", "layout", 1)
 
         edits.append(("batch_major.onnx", batch_major, "layout"))
+
+        def missing_initial_hidden(model):
+            node(model, "GRU").input[5] = ""
+
+        edits.append(("missing_initial_hidden.onnx", missing_initial_hidden, "initial_h|initial hidden"))
+
+        def sequence_lengths(model):
+            model.graph.input.append(helper.make_tensor_value_info("sequence_lens", TensorProto.INT32, [None]))
+            node(model, "GRU").input[4] = "sequence_lens"
+
+        edits.append(("sequence_lengths.onnx", sequence_lengths, "sequence_lens"))
+
+        def clipped_gru(model):
+            set_attribute(model, "GRU", "clip", 0.25)
+
+        edits.append(("clipped_gru.onnx", clipped_gru, "clip"))
+
+        def custom_activations(model):
+            set_attribute(model, "GRU", "activations", ["HardSigmoid", "Tanh"])
+
+        edits.append(("custom_activations.onnx", custom_activations, "activations"))
+
+        for attribute in ("activation_alpha", "activation_beta"):
+
+            def custom_activation_parameter(model, attribute=attribute):
+                set_attribute(model, "GRU", attribute, [0.25, 0.5])
+
+            edits.append((f"{attribute}.onnx", custom_activation_parameter, attribute))
 
         def missing_weights(model):
             node(model, "GRU").input[1] = "missing_weight"
@@ -1081,6 +1282,22 @@ class TestDriveNeuralGRU(unittest.TestCase):
 
         edits.append(("unsupported_output.onnx", unsupported_output, "unsupported output operation"))
 
+        def reversed_output_operations(model):
+            tanh = node(model, "Tanh")
+            scale = node(model, "Mul")
+            tanh.op_type = "Mul"
+            tanh.input.append("output_scale")
+            scale.op_type = "Tanh"
+            del scale.input[1:]
+
+        edits.append(("reversed_output_operations.onnx", reversed_output_operations, "order|unsupported output"))
+
+        def disconnected_head(model):
+            model.graph.input.append(helper.make_tensor_value_info("unrelated_features", TensorProto.FLOAT, [None, 4]))
+            node(model, "Gemm").input[0] = "unrelated_features"
+
+        edits.append(("disconnected_head.onnx", disconnected_head, "GRU|output head"))
+
         def disconnected_output(model):
             model.graph.output[0].name = "not_the_head_output"
 
@@ -1093,6 +1310,7 @@ class TestDriveNeuralGRU(unittest.TestCase):
                     DriveNeuralGRU(path)
 
     def test_accepts_identity_output_and_rejects_invalid_runtime_state(self):
+        """Accept an Identity output tail and reject an unfinalized or mismatched state."""
         source = self._save_gru("linear_output.onnx", apply_tanh=False, output_scale=1.0)
 
         def append_identity(model):
@@ -1107,36 +1325,247 @@ class TestDriveNeuralGRU(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "device"):
             case.actuator.drive.state(1, object())
 
-        case.actuator.drive._bound_bias_force = case.state.mujoco.qfrc_bias
-        self._compute_direct(case, case.state_a.drive_state)
+        self._compute_direct(case, case.state_a.drive_state, feedforward=case.state.bias_force)
         with self.assertRaisesRegex(ValueError, "next drive state"):
             case.actuator.drive.update_state(case.state_a.drive_state, DriveNeuralGRU.State())
 
-    def test_state_creation_and_graphability(self):
-        path = self._save_gru("state_contract.onnx")
-        drive = DriveNeuralGRU(path)
+    def test_state_creation_rejects_unfinalized_and_empty_state(self):
+        """Refuse to create state before finalize, and to reset a state with no hidden array."""
+        drive = DriveNeuralGRU(self._save_gru("state_contract.onnx"))
         with self.assertRaisesRegex(RuntimeError, "finalized"):
             drive.state(1, self.device)
-
-        case = self._make_case(path, 2)
-        self.assertTrue(case.actuator.drive.is_stateful())
-        self.assertTrue(case.actuator.drive.is_graphable())
         with self.assertRaisesRegex(ValueError, "no hidden"):
             DriveNeuralGRU.State().reset()
 
+    def test_implicit_path_forwards_declared_custom_inputs(self):
+        """Hand a drive's declared inputs to prepare_implicit, as the explicit path does."""
+
+        class _RecordingDrive(DrivePD):
+            custom_inputs = (("sim_state", "bias_force"),)
+            seen = None
+
+            def prepare_implicit(self, *args, custom_inputs=None, **kwargs):
+                type(self).seen = custom_inputs
+                return super().prepare_implicit(*args, **kwargs)
+
+        device = self.device
+        model = _build_pendulum(device)
+        state, control = model.state(), model.control()
+        oracle = ResponseOracle(model)
+        actuator = Actuator(
+            indices=wp.array([0], dtype=wp.uint32, device=device),
+            drive=_RecordingDrive(
+                kp=wp.array([100.0], dtype=wp.float32, device=device),
+                kd=wp.array([10.0], dtype=wp.float32, device=device),
+            ),
+        )
+        actuator.set_effort_mode_implicit(response=oracle)
+
+        bias = wp.zeros(model.joint_dof_count, dtype=wp.float32, device=device)
+        sim_state = types.SimpleNamespace(joint_q=state.joint_q, joint_qd=state.joint_qd, bias_force=bias)
+        oracle.refresh(state)
+        control.joint_f.zero_()
+        actuator.step(sim_state, control, dt=0.01)
+
+        self.assertIsNotNone(_RecordingDrive.seen)
+        self.assertIs(_RecordingDrive.seen["bias_force"], bias)
+
+        # The same rules apply: a sim_state without the array still raises.
+        with self.assertRaisesRegex(ValueError, "requires the array 'bias_force'"):
+            actuator.step(state, control, dt=0.01)
+
+    def test_custom_input_name_comes_from_metadata(self):
+        """Take the caller-supplied column's name from custom_inputs metadata."""
+        metadata = self._metadata(("position", "qfrc_bias"))
+        metadata["custom_inputs"] = ["qfrc_bias"]
+        metadata["normalization"]["inputs"]["mean"]["qfrc_bias"] = -2.0
+        metadata["normalization"]["inputs"]["std"]["qfrc_bias"] = 5.0
+        case = self._make_case(self._save_gru("named_custom.onnx", metadata, input_size=2), 2)
+        self.assertEqual(case.actuator.drive.custom_inputs, (("sim_state", "qfrc_bias"),))
+
+        # The array is read under the name the checkpoint chose, not "bias_force".
+        case.state.qfrc_bias = case.state.bias_force
+        del case.state.bias_force
+
+        effort, _ = self._step(case)
+
+        np.testing.assert_allclose(effort, self._expected(metadata, case)[0], rtol=1e-5, atol=1e-6)
+
+    def test_rejects_unknown_and_clashing_custom_inputs(self):
+        """Reject a column that is neither built in nor declared, and a clashing declaration."""
+        undeclared = self._metadata(("position", "mystery"))
+        path = self._save_gru("undeclared.onnx", undeclared, input_size=2)
+        with self.assertRaisesRegex(ValueError, "unsupported input_columns: mystery"):
+            DriveNeuralGRU(path)
+
+        clashing = self._metadata(("position", "velocity"))
+        clashing["custom_inputs"] = ["velocity"]
+        path = self._save_gru("clashing.onnx", clashing, input_size=2)
+        with self.assertRaisesRegex(ValueError, "may not reuse built-in feature names"):
+            DriveNeuralGRU(path)
+
+        too_many = self._metadata(("position",))
+        too_many["custom_inputs"] = ["a", "b"]
+        path = self._save_gru("too_many.onnx", too_many, input_size=1)
+        with self.assertRaisesRegex(ValueError, "at most one custom input"):
+            DriveNeuralGRU(path)
+
+        for index, declared in enumerate(("bias_force", [1], [""], ["bias force"])):
+            malformed = self._metadata(("position",))
+            malformed["custom_inputs"] = declared
+            path = self._save_gru(f"malformed_{index}.onnx", malformed, input_size=1)
+            with self.subTest(custom_inputs=declared), self.assertRaisesRegex(ValueError, "must be a list of names"):
+                DriveNeuralGRU(path)
+
+    def test_step_replays_under_cuda_graph_capture(self):
+        """Capture a GRU step into a CUDA graph and reproduce the eager effort on replay."""
+        if not self.device.is_cuda:
+            self.skipTest("CUDA graph capture requires a CUDA device")
+
+        case = self._make_case(self._save_gru("captured.onnx"), 2)
+        eager, _ = self._step(case)
+
+        # Deliberately no warm-up beyond the eager step above: finalize() is
+        # responsible for populating Warp-NN's shape caches before capture.
+        case.control.joint_f.zero_()
+        with wp.ScopedCapture(self.device) as capture:
+            case.actuator.step(case.state, case.control, case.state_a, case.state_b, dt=self.SAMPLE_DT)
+
+        wp.capture_launch(capture.graph)
+        np.testing.assert_allclose(case.control.joint_f.numpy()[case.indices], eager, rtol=1e-5, atol=1e-6)
+
+        # A second replay accumulates one more identical contribution, since
+        # the states are not swapped and joint_f is scatter-added into.
+        wp.capture_launch(capture.graph)
+        np.testing.assert_allclose(case.control.joint_f.numpy()[case.indices], 2.0 * eager, rtol=1e-5, atol=1e-6)
+
+    def test_sim_state_container_exposes_required_fields(self):
+        """Hand back an empty, slotted container with exactly the fields the actuator reads."""
+        case = self._make_case(self._save_gru("container.onnx"), 2)
+
+        sim_state = case.actuator.sim_state()
+        self.assertEqual(sorted(type(sim_state).__slots__), ["bias_force", "joint_q", "joint_qd"])
+
+        # A checkpoint that selects no custom column contributes no field.
+        metadata = self._metadata(("position", "target_velocity"))
+        without = self._make_case(self._save_gru("container_none.onnx", metadata, input_size=2), 2)
+        self.assertFalse(hasattr(without.actuator.sim_state(), "bias_force"))
+        self.assertIsNone(sim_state.joint_q)
+        self.assertIsNone(sim_state.bias_force)
+
+        with self.assertRaises(AttributeError):
+            sim_state.joint_qq = case.state.joint_q
+
+        # An unassigned field raises instead of reaching a kernel with None.
+        sim_state.joint_qd = case.state.joint_qd
+        sim_state.bias_force = case.state.bias_force
+        with self.assertRaisesRegex(ValueError, "'joint_q' is None"):
+            case.actuator.step(sim_state, case.control, case.state_a, case.state_b, dt=self.SAMPLE_DT)
+
+        sim_state.joint_q = case.state.joint_q
+        sim_state.joint_qd = case.state.joint_qd
+        sim_state.bias_force = case.state.bias_force
+
+        case.control.joint_f.zero_()
+        case.actuator.step(sim_state, case.control, case.state_a, case.state_b, dt=self.SAMPLE_DT)
+        np.testing.assert_allclose(
+            case.control.joint_f.numpy()[case.indices],
+            self._expected(self._metadata(), case)[0],
+            rtol=1e-5,
+            atol=1e-6,
+        )
+
+    def test_sim_state_may_be_an_object_or_a_mapping(self):
+        """Read state and the drive's extra arrays from a namespace or from a dict."""
+        case = self._make_case(self._save_gru("sources.onnx"), 2)
+        expected = self._expected(self._metadata(), case)[0]
+
+        as_dict = {
+            "joint_q": case.state.joint_q,
+            "joint_qd": case.state.joint_qd,
+            "bias_force": case.state.bias_force,
+        }
+        for label, sim_state in (("namespace", case.state), ("dict", as_dict)):
+            with self.subTest(sim_state=label):
+                case.control.joint_f.zero_()
+                case.state_a.reset()
+                case.actuator.step(sim_state, case.control, case.state_a, case.state_b, dt=self.SAMPLE_DT)
+                np.testing.assert_allclose(case.control.joint_f.numpy()[case.indices], expected, rtol=1e-5, atol=1e-6)
+
+    def test_step_follows_the_array_the_sim_state_points_at(self):
+        """Use the array the sim_state references now, not one seen on an earlier step."""
+        case = self._make_case(self._save_gru("per_step.onnx"), 2)
+        _, hidden_first = self._step(case)
+        case.state_a, case.state_b = case.state_b, case.state_a
+
+        # A different array object, substituted after a step has already run.
+        case.bias_force = case.bias_force * -3.0
+        case.state.bias_force = wp.array(case.bias_force, dtype=wp.float32, device=self.device)
+
+        observed, _ = self._step(case)
+
+        expected = self._expected(self._metadata(), case, hidden=hidden_first)[0]
+        np.testing.assert_allclose(observed, expected, rtol=1e-5, atol=1e-6)
+
+    def test_builder_leaves_declared_arrays_to_the_caller(self):
+        """Name the array at build time without allocating on State or Control."""
+
+        def build_model(model_path):
+            builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
+            link = builder.add_link()
+            joint = builder.add_joint_revolute(parent=-1, child=link, axis=newton.Axis.Z)
+            builder.add_articulation([joint])
+            builder.add_actuator(
+                DriveNeuralGRU,
+                index=builder.joint_qd_start[joint],
+                model_path=model_path,
+            )
+            return builder.finalize(device=self.device)
+
+        model = build_model(self._save_gru("declared_only.onnx"))
+        actuator = model.actuators[0]
+        self.assertEqual(actuator.drive.custom_inputs, (("sim_state", "bias_force"),))
+        self.assertEqual(actuator.control_feedforward_attr, "joint_act")
+
+        # Newton allocates nothing and touches neither State nor Control.
+        self.assertFalse(hasattr(model.control(), "bias_force"))
+        self.assertFalse(hasattr(model.state(), "bias_force"))
+
+        # The caller wraps the real State and adds the array the drive named.
+        bias = wp.full(model.joint_dof_count, 2.5, dtype=wp.float32, device=self.device)
+        state, control = model.state(), model.control()
+        sim_state = types.SimpleNamespace(joint_q=state.joint_q, joint_qd=state.joint_qd, bias_force=bias)
+        control.clear(model)
+        control.joint_f.zero_()
+        a, b = actuator.state(), actuator.state()
+        actuator.step(sim_state, control, a, b, dt=self.SAMPLE_DT)
+        self.assertTrue(np.isfinite(control.joint_f.numpy()).all())
+
+        metadata = self._metadata(("position", "target_velocity"))
+        without_bias = build_model(self._save_gru("declared_none.onnx", metadata))
+        self.assertEqual(without_bias.actuators[0].drive.custom_inputs, ())
+
     @unittest.skipUnless(HAS_USD, "pxr not installed")
     def test_model_builder_constructs_relative_onnx_usd_actuator(self):
+        """Construct a finalized GRU actuator from a relative USD asset path."""
         model_path = self._save_gru("builder_gru.onnx")
         stage_path = self._write_single_joint_gru_usd(model_path, "builder_gru.usda")
 
         builder = newton.ModelBuilder()
         result = builder.add_usd(stage_path, floating=False, load_visual_shapes=False)
         self.assertEqual(result["actuator_count"], 1)
+        # This test covers actuator parsing, not the OpenUSD package-dependent
+        # articulation discovery performed by LoadUsdPhysicsFromRange.
+        joint_index = builder.joint_label.index("/World/Robot/Joint")
+        builder.add_articulation([joint_index], label="/World/Robot")
         model = builder.finalize(device=self.device)
         self.assertIsInstance(model.actuators[0].drive, DriveNeuralGRU)
-        self.assertEqual(model.state().mujoco.qfrc_bias.shape, (model.joint_dof_count,))
+        self.assertEqual(model.actuators[0].control_feedforward_attr, "joint_act")
+        self.assertEqual(model.actuators[0].drive.custom_inputs, (("sim_state", "bias_force"),))
+        self.assertFalse(hasattr(model.control(), "bias_force"))
 
     def test_builder_groups_equal_model_paths(self):
+        """Accumulate actuators sharing one checkpoint into a single vectorized group."""
         shared_path = self._save_gru("shared.onnx")
         distinct_path = self._save_gru("distinct.onnx", rng_seed=2026)
         builder = newton.ModelBuilder(gravity=(0.0, 0.0, 0.0))
@@ -1160,12 +1589,14 @@ class TestDriveNeuralGRU(unittest.TestCase):
 
     @unittest.skipUnless(HAS_USD, "pxr not installed")
     def test_usd_dispatches_onnx_asset_to_gru(self):
+        """Dispatch a USD actuator prim with gru model_type to DriveNeuralGRU."""
         from pxr import Sdf
 
         model_path = self._save_gru("usd_gru.onnx")
         stage_path = os.path.join(self._tmp_dir, "gru.usda")
         stage = Usd.Stage.CreateNew(stage_path)
         stage.DefinePrim("/World/Joint", "PhysicsRevoluteJoint")
+        stage.DefinePrim("/World/PhysicsScene", "PhysicsScene")
         prim = stage.DefinePrim("/World/Actuator", "NewtonActuator")
         schemas = Sdf.TokenListOp()
         schemas.prependedItems = ["NewtonNeuralControlAPI"]
