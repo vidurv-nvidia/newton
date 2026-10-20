@@ -735,6 +735,17 @@ class _GaussSeidelSolver(_RheologySolver):
             has_compliance_mat=self.rheology.compliance_mat.nnz > 0,
             strain_velocity_node_count=self.rheology.strain_velocity_node_count,
         )
+        # Tune the existing GS kernel launch for its register-cached specialization.
+        if (
+            self.device.is_cuda
+            and self.rheology.has_viscosity
+            and self.rheology.has_dilatancy
+            and self.rheology.compliance_mat.nnz == 0
+            and self.rheology.strain_velocity_node_count == 8
+        ):
+            color_launch_dim = max(1, min(2048, self.rheology.color_blocks.shape[1]))
+            color_block_dim = 4
+            color_block_count = (color_launch_dim + color_block_dim - 1) // color_block_dim
         self.solve_local_launch = wp.launch(
             kernel=gs_kernel,
             dim=color_launch_dim,

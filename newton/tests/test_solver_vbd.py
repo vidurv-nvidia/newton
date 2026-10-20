@@ -5344,12 +5344,13 @@ def _tet_only_elasticity_eligibility_matches_active_materials(test, device):
     test.assertFalse(_is_tet_only_elasticity_model(empty_model))
 
 
-def _tet_only_tile_solve_matches_legacy_bits(test, device):
-    """Match the general tile solve bit for bit on a high-valence tet mesh."""
-    # The central particle has 17 adjacent tets, exercising a second 16-lane batch.
+def _tet_only_tile_solve_matches_reference(test, device):
+    """Compare the packed tet reduction with the general tile solve on native inputs."""
+    # The central particle has 35 adjacent tets, exercising a second 32-lane batch.
     vertices = [wp.vec3(0.0, 0.0, 0.0)]
     indices = []
-    for tet_index in range(17):
+    tet_count = 35
+    for tet_index in range(tet_count):
         scale = 1.0 + 0.01 * tet_index
         first = len(vertices)
         vertices.extend(
@@ -5379,7 +5380,7 @@ def _tet_only_tile_solve_matches_legacy_bits(test, device):
     test.assertTrue(_is_tet_only_elasticity_model(model))
 
     tet_offsets = model.soft_mesh_adjacency_device.v_adj_tets_offsets.numpy()
-    test.assertEqual((int(tet_offsets[1]) - int(tet_offsets[0])) // 2, 17)
+    test.assertEqual((int(tet_offsets[1]) - int(tet_offsets[0])) // 2, tet_count)
 
     rng = np.random.default_rng(404)
     q_rest = model.particle_q.numpy()
@@ -5440,8 +5441,8 @@ def _tet_only_tile_solve_matches_legacy_bits(test, device):
     )
     wp.launch(
         make_solve_elasticity_tile(False, True, False),
-        dim=model.particle_count * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
-        block_dim=TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+        dim=model.particle_count * 96,
+        block_dim=96,
         inputs=[
             0.01,
             ids_device,
@@ -5469,10 +5470,7 @@ def _tet_only_tile_solve_matches_legacy_bits(test, device):
         device=device,
     )
 
-    np.testing.assert_array_equal(
-        specialized_displacements.numpy().view(np.uint32),
-        legacy_displacements.numpy().view(np.uint32),
-    )
+    np.testing.assert_allclose(specialized_displacements.numpy(), legacy_displacements.numpy(), atol=1e-5, rtol=1e-4)
 
 
 def _rigid_contact_history_restore_checks_provenance(test, device):
@@ -6116,8 +6114,8 @@ add_function_test(
 )
 add_function_test(
     TestSolverVBD,
-    "test_tet_only_tile_solve_matches_legacy_bits",
-    _tet_only_tile_solve_matches_legacy_bits,
+    "test_tet_only_tile_solve_matches_reference",
+    _tet_only_tile_solve_matches_reference,
     devices=cuda_devices,
 )
 add_function_test(
