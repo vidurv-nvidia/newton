@@ -1068,6 +1068,80 @@ def make_gs_solve_kernel(
     return gs_solve_kernel_impl
 
 
+def make_cached_gs_solve_kernel(has_rotation: bool = not _ISOTROPIC_LOCAL_LHS):
+    """Cache eight-node row data in registers for the viscous, dilatant GS specialization.
+
+    This path requires eight velocity nodes per nonempty strain row and no
+    compliance matrix. It retains ordered row and duplicate-node updates.
+    """
+    nodes8 = wp.types.vector(length=8, dtype=wp.int32)
+    mass8 = wp.types.vector(length=8, dtype=wp.float32)
+    gradients8 = wp.types.matrix(shape=(8, 3), dtype=wp.float32)
+
+    @fem.cache.dynamic_kernel(suffix=has_rotation, kernel_options={"fast_math": True})
+    def cached_gs_solve_kernel_impl(
+        color: int,
+        launch_dim: int,
+        color_offsets: wp.array[int],
+        color_blocks: wp.array2d[int],
+        yield_params: wp.array[YieldParamVec],
+        strain_node_volume: wp.array[float],
+        compliance_mat_offsets: wp.array[int],
+        compliance_mat_columns: wp.array[int],
+        compliance_mat_values: wp.array[mat66],
+        strain_mat_offsets: wp.array[int],
+        strain_mat_columns: wp.array[int],
+        strain_mat_values: wp.array[mat13],
+        delassus_diagonal: wp.array[vec6],
+        delassus_rotation: wp.array[mat55],
+        inv_mass_matrix: wp.array[float],
+        local_strain_rhs: wp.array[vec6],
+        velocities: wp.array[wp.vec3],
+        local_stress: wp.array[vec6],
+        delta_correction: wp.array[vec6],
+    ):
+        i = wp.tid()
+        color_beg = color_offsets[color] + i
+        color_end = color_offsets[color + 1]
+        for color_offset in range(color_beg, color_end, launch_dim):
+            beg, end = color_blocks[0, color_offset], color_blocks[1, color_offset]
+            for row in range(beg, end):
+                offset = strain_mat_offsets[row]
+                if offset == strain_mat_offsets[row + 1]:
+                    delta_correction[row] = vec6(0.0)
+                    continue
+                strain = local_strain_rhs[row]
+                nodes = nodes8(0)
+                gradients = gradients8(0.0)
+                masses = mass8(0.0)
+                for corner in range(8):
+                    entry = offset + corner
+                    node = strain_mat_columns[entry]
+                    gradient = strain_mat_values[entry]
+                    nodes[corner] = node
+                    gradients[corner] = gradient
+                    masses[corner] = inv_mass_matrix[node]
+                    strain += _symmetric_part_op(gradient, velocities[node])
+                delta = wp.static(make_solve_local_stress(True, True, has_rotation))(
+                    row,
+                    strain,
+                    yield_params,
+                    strain_node_volume,
+                    delassus_diagonal,
+                    delassus_rotation,
+                    local_stress,
+                )
+                local_stress[row] += delta
+                delta_correction[row] = delta
+                # Sequential scatter preserves repeated column indices within a row.
+                for corner in range(8):
+                    velocities[nodes[corner]] += masses[corner] * _symmetric_part_transposed_op(
+                        gradients[corner], delta
+                    )
+
+    return cached_gs_solve_kernel_impl
+
+
 # ── Reordered (SoA) GS solver ───────────────────────────────────────────────
 #
 # Entry-major SoA reordering of the BSR strain matrix for coalesced memory

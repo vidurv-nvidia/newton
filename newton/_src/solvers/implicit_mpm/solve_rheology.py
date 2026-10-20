@@ -45,6 +45,7 @@ from .rheology_solver_kernels import (
     globalize_batch_offsets,
     jacobi_preconditioner,
     make_batched_solve_kernel,
+    make_cached_gs_solve_kernel,
     make_gs_solve_kernel,
     make_jacobi_solve_kernel,
     make_reordered_gs_solve_kernel,
@@ -735,6 +736,18 @@ class _GaussSeidelSolver(_RheologySolver):
             has_compliance_mat=self.rheology.compliance_mat.nnz > 0,
             strain_velocity_node_count=self.rheology.strain_velocity_node_count,
         )
+        # The cached kernel consumes the original matrix; no setup preprocessing.
+        if (
+            self.device.is_cuda
+            and self.rheology.has_viscosity
+            and self.rheology.has_dilatancy
+            and self.rheology.compliance_mat.nnz == 0
+            and self.rheology.strain_velocity_node_count == 8
+        ):
+            gs_kernel = make_cached_gs_solve_kernel()
+            color_launch_dim = max(1, min(2048, self.rheology.color_blocks.shape[1]))
+            color_block_dim = 4
+            color_block_count = (color_launch_dim + color_block_dim - 1) // color_block_dim
         self.solve_local_launch = wp.launch(
             kernel=gs_kernel,
             dim=color_launch_dim,

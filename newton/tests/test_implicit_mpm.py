@@ -26,6 +26,9 @@ from newton._src.solvers.implicit_mpm.rheology_solver_kernels import (
     _symmetric_part_transposed_op,
     apply_stress_gs,
     compute_delassus_diagonal,
+    make_cached_gs_solve_kernel,
+    make_gs_solve_kernel,
+    mat13,
     mat55,
     mat66,
     postprocess_stress_and_strain,
@@ -2207,6 +2210,79 @@ basic_devices = get_test_devices(mode="basic")
 basic_cuda_devices = get_cuda_test_devices(mode="basic")
 
 
+def test_cached_gs_matches_reference(test, device):
+    """Preserve ordered updates, empty rows, duplicate nodes, and recorded color changes."""
+    rng = np.random.default_rng(61)
+    row_count, node_count = 7, 24
+    offsets = [0, 0, 8, 16, 24, 32, 40, 40]
+    # Blocks in the same color are independent; rows in each block share nodes.
+    columns = np.concatenate([np.arange(first, first + 8) for first in (0, 8, 8, 16, 16)]).astype(np.int32)
+    columns[7] = columns[6]
+    gradients = rng.normal(0, 0.1, (40, 3)).astype(np.float32)
+    initial_velocity = rng.normal(0, 0.2, (node_count, 3)).astype(np.float32)
+    initial_stress = rng.normal(0, 0.1, (row_count, 6)).astype(np.float32)
+    rotations = np.stack([np.linalg.qr(rng.normal(size=(5, 5)))[0] for _ in range(row_count)]).astype(np.float32)
+
+    def array(data, dtype):
+        return wp.array(np.asarray(data), dtype=dtype, device=device)
+
+    shared = [
+        array([0, 2, 2, 3], int),
+        array([[0, 2, 4], [2, 4, 7]], int),
+        array(np.tile([5.0, 1.0, 0.2, 0.5, 0.2, 0.1], (row_count, 1)), YieldParamVec),
+        array(np.linspace(0.7, 1.3, row_count), float),
+        wp.zeros(row_count + 1, dtype=int, device=device),
+        wp.empty(0, dtype=int, device=device),
+        wp.empty(0, dtype=mat66, device=device),
+        array(offsets, int),
+        array(columns, int),
+        array(gradients, mat13),
+        array(rng.uniform(0.5, 2.0, (row_count, 6)), vec6),
+        array(rotations, mat55),
+        array(rng.uniform(0.5, 2.0, node_count), float),
+        array(rng.normal(0, 0.3, (row_count, 6)), vec6),
+    ]
+    outputs = []
+    for kernel, workers, block_dim in [
+        (make_gs_solve_kernel(True, True, False, 8), 64, 64),
+        (make_cached_gs_solve_kernel(), 1, 4),
+        (make_cached_gs_solve_kernel(), 4, 4),
+    ]:
+        velocity = array(initial_velocity, wp.vec3)
+        stress = array(initial_stress, vec6)
+        delta = wp.full(row_count, vec6(17.0), dtype=vec6, device=device)
+        command = wp.launch(
+            kernel,
+            dim=workers,
+            block_dim=block_dim,
+            inputs=[0, workers, *shared],
+            outputs=[velocity, stress, delta],
+            device=device,
+            record_cmd=True,
+        )
+        for color in range(3):
+            command.set_param_at_index(0, color)
+            command.launch()
+        result = [value.numpy() for value in (velocity, stress, delta)]
+        # Empty rows retain stress and explicitly clear correction, including on replay.
+        np.testing.assert_array_equal(result[1][[0, 6]], initial_stress[[0, 6]])
+        np.testing.assert_array_equal(result[2][[0, 6]], np.zeros((2, 6)))
+        velocity.assign(initial_velocity)
+        stress.assign(initial_stress)
+        delta.fill_(vec6(17.0))
+        with wp.ScopedCapture(device=device) as capture:
+            for color in range(3):
+                command.set_param_at_index(0, color)
+                command.launch()
+        wp.capture_launch(capture.graph)
+        for actual, expected in zip((velocity, stress, delta), result, strict=True):
+            np.testing.assert_allclose(actual.numpy(), expected, atol=1e-6, rtol=1e-5)
+        outputs.append(result)
+    for result in outputs[1:]:
+        for actual, expected in zip(result, outputs[0], strict=True):
+            np.testing.assert_allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+
 class TestImplicitMPM(unittest.TestCase):
     pass
 
@@ -2520,6 +2596,13 @@ add_function_test(
     check_output=False,
 )
 
+
+add_function_test(
+    TestImplicitMPM,
+    "test_cached_gs_matches_reference",
+    test_cached_gs_matches_reference,
+    devices=get_cuda_test_devices(),
+)
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)

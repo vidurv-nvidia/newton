@@ -76,7 +76,6 @@ class Example:
             model=self.model,
             iterations=self.iterations,
             particle_enable_self_contact=False,
-            particle_enable_tile_solve=False,
         )
 
         self.state_0 = self.model.state()

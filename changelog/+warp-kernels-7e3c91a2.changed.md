@@ -1,0 +1,1 @@
+Accelerate CUDA tetrahedral VBD elasticity and the eight-node viscous, dilatant MPM Gauss–Seidel solve. Existing solver configurations remain supported; the hanging-softbody example now uses the default tiled elasticity path.
