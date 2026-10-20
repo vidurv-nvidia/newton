@@ -44,7 +44,6 @@ from ..tendon_state import TendonStateMixin
 from ..xpbd import kernels as xpbd_kernels
 from ..xpbd.kernels import apply_joint_forces, project_joint_mimics
 from . import particle_vbd_kernels, rigid_vbd_kernels, vbd_coupling_kernels
-from .particle_elasticity_kernels import solve_elasticity_cooperative
 from .particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
@@ -1131,7 +1130,6 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
             )
             self._tiled_elasticity_particles_per_block = 2 if two_particles_per_warp else 1
             if include_tets and not include_triangles:
-                self._tiled_elasticity_kernel = solve_elasticity_cooperative
                 self._tiled_elasticity_threads_per_particle = 96
         if particle_enable_self_contact:
             self.particle_conservative_bounds = wp.zeros((model.particle_count,), dtype=float, device=self.device)

@@ -15,7 +15,6 @@ import warp as wp
 import newton
 from newton._src.geometry.soft_contacts_mesh import _SoftContactFilterData
 from newton._src.geometry.tri_mesh_collision import TriMeshCollisionInfo, build_tri_mesh_collision_info
-from newton._src.solvers.vbd.particle_elasticity_kernels import solve_elasticity_cooperative
 from newton._src.solvers.vbd.particle_vbd_kernels import (
     NUM_THREADS_PER_COLLISION_PRIMITIVE,
     TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
@@ -5176,9 +5175,9 @@ def _body_particle_attachment_to_cable_capsule(test, device):
     test.assertGreater(float(np.linalg.norm(particle_q[particle] - initial_particle_pos)), 1.0e-3)
 
 
-def _two_particle_tile_solve_matches_legacy_bits(test, device, cooperative=False):
+def _two_particle_tile_solve_matches_legacy_bits(test, device):
     """Pack odd-sized, high-valence cloth work without changing any result bit."""
-    ring_count = 34 if cooperative else 20
+    ring_count = 20
     angles = np.arange(ring_count, dtype=np.float64) * (2.0 * np.pi / ring_count)
     vertices = [wp.vec3(0.0, 0.0, 0.0)]
     vertices.extend(wp.vec3(float(np.cos(a)), float(np.sin(a)), 0.0) for a in angles)
@@ -5271,11 +5270,9 @@ def _two_particle_tile_solve_matches_legacy_bits(test, device, cooperative=False
         device=device,
     )
     wp.launch(
-        solve_elasticity_cooperative if cooperative else make_solve_elasticity_tile(True, False, True),
-        dim=model.particle_count * 96
-        if cooperative
-        else ((model.particle_count + 1) // 2) * (2 * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE),
-        block_dim=96 if cooperative else 2 * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+        make_solve_elasticity_tile(True, False, True),
+        dim=((model.particle_count + 1) // 2) * (2 * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE),
+        block_dim=2 * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
         inputs=[
             *common_inputs,
             model.tet_indices,
@@ -5288,9 +5285,6 @@ def _two_particle_tile_solve_matches_legacy_bits(test, device, cooperative=False
         outputs=[packed_displacements],
         device=device,
     )
-    if cooperative:
-        np.testing.assert_allclose(packed_displacements.numpy(), legacy_displacements.numpy(), atol=1e-5, rtol=1e-4)
-        return
     legacy_bits = legacy_displacements.numpy().view(np.uint32)
     packed_bits = packed_displacements.numpy().view(np.uint32)
     np.testing.assert_array_equal(packed_bits, legacy_bits)
@@ -5350,12 +5344,12 @@ def _tet_only_elasticity_eligibility_matches_active_materials(test, device):
     test.assertFalse(_is_tet_only_elasticity_model(empty_model))
 
 
-def _tet_only_tile_solve_matches_legacy_bits(test, device, cooperative=False):
-    """Match the general tile solve bit for bit on a high-valence tet mesh."""
-    # The central particle has 17 adjacent tets, exercising a second 16-lane batch.
+def _tet_only_tile_solve_matches_reference(test, device):
+    """Compare the packed tet reduction with the general tile solve on native inputs."""
+    # The central particle has 35 adjacent tets, exercising a second 32-lane batch.
     vertices = [wp.vec3(0.0, 0.0, 0.0)]
     indices = []
-    tet_count = 35 if cooperative else 17
+    tet_count = 35
     for tet_index in range(tet_count):
         scale = 1.0 + 0.01 * tet_index
         first = len(vertices)
@@ -5446,9 +5440,9 @@ def _tet_only_tile_solve_matches_legacy_bits(test, device, cooperative=False):
         device=device,
     )
     wp.launch(
-        solve_elasticity_cooperative if cooperative else make_solve_elasticity_tile(False, True, False),
-        dim=model.particle_count * 96 if cooperative else model.particle_count * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
-        block_dim=96 if cooperative else TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+        make_solve_elasticity_tile(False, True, False),
+        dim=model.particle_count * 96,
+        block_dim=96,
         inputs=[
             0.01,
             ids_device,
@@ -5476,15 +5470,7 @@ def _tet_only_tile_solve_matches_legacy_bits(test, device, cooperative=False):
         device=device,
     )
 
-    if cooperative:
-        np.testing.assert_allclose(
-            specialized_displacements.numpy(), legacy_displacements.numpy(), atol=1e-5, rtol=1e-4
-        )
-        return
-    np.testing.assert_array_equal(
-        specialized_displacements.numpy().view(np.uint32),
-        legacy_displacements.numpy().view(np.uint32),
-    )
+    np.testing.assert_allclose(specialized_displacements.numpy(), legacy_displacements.numpy(), atol=1e-5, rtol=1e-4)
 
 
 def _rigid_contact_history_restore_checks_provenance(test, device):
@@ -5854,16 +5840,6 @@ def _rigid_hinge_multiturn_limits(test, device):
             test.assertLess(np.max(np.abs(state_in.body_qd.numpy()[:, 5])), 1.0e-2)
 
 
-def _cooperative_elasticity_cloth(test, device):
-    """Match cloth elasticity across inactive particles and multiple adjacency batches."""
-    _two_particle_tile_solve_matches_legacy_bits(test, device, cooperative=True)
-
-
-def _cooperative_elasticity_tets(test, device):
-    """Match volumetric elasticity with empty cloth arrays and high-valence tetrahedra."""
-    _tet_only_tile_solve_matches_legacy_bits(test, device, cooperative=True)
-
-
 class TestSolverVBD(unittest.TestCase):
     def test_contact_kernel_modules_follow_deterministic_mode(self):
         """Apply VBD deterministic options to rigid contact kernels."""
@@ -5888,11 +5864,6 @@ class TestSolverVBD(unittest.TestCase):
             self.assertEqual(options["deterministic"], wp.DeterministicMode.RUN_TO_RUN)
             self.assertFalse(options["enable_backward"])
 
-
-add_function_test(
-    TestSolverVBD, "test_cooperative_elasticity_cloth", _cooperative_elasticity_cloth, devices=cuda_devices
-)
-add_function_test(TestSolverVBD, "test_cooperative_elasticity_tets", _cooperative_elasticity_tets, devices=cuda_devices)
 
 add_function_test(TestSolverVBD, "test_rigid_hinge_multiturn_drive", _rigid_hinge_multiturn_drive, devices=devices)
 add_function_test(TestSolverVBD, "test_rigid_hinge_multiturn_limits", _rigid_hinge_multiturn_limits, devices=devices)
@@ -6143,8 +6114,8 @@ add_function_test(
 )
 add_function_test(
     TestSolverVBD,
-    "test_tet_only_tile_solve_matches_legacy_bits",
-    _tet_only_tile_solve_matches_legacy_bits,
+    "test_tet_only_tile_solve_matches_reference",
+    _tet_only_tile_solve_matches_reference,
     devices=cuda_devices,
 )
 add_function_test(

@@ -26,7 +26,6 @@ from newton._src.solvers.implicit_mpm.rheology_solver_kernels import (
     _symmetric_part_transposed_op,
     apply_stress_gs,
     compute_delassus_diagonal,
-    make_cached_gs_solve_kernel,
     make_gs_solve_kernel,
     mat13,
     mat55,
@@ -2210,7 +2209,7 @@ basic_devices = get_test_devices(mode="basic")
 basic_cuda_devices = get_cuda_test_devices(mode="basic")
 
 
-def test_cached_gs_matches_reference(test, device):
+def test_gs_eight_node_matches_generic(test, device):
     """Preserve ordered updates, empty rows, duplicate nodes, and recorded color changes."""
     rng = np.random.default_rng(61)
     row_count, node_count = 7, 24
@@ -2244,9 +2243,9 @@ def test_cached_gs_matches_reference(test, device):
     ]
     outputs = []
     for kernel, workers, block_dim in [
-        (make_gs_solve_kernel(True, True, False, 8), 64, 64),
-        (make_cached_gs_solve_kernel(), 1, 4),
-        (make_cached_gs_solve_kernel(), 4, 4),
+        (make_gs_solve_kernel(True, True, False), 64, 64),
+        (make_gs_solve_kernel(True, True, False, 8), 1, 4),
+        (make_gs_solve_kernel(True, True, False, 8), 4, 4),
     ]:
         velocity = array(initial_velocity, wp.vec3)
         stress = array(initial_stress, vec6)
@@ -2270,11 +2269,16 @@ def test_cached_gs_matches_reference(test, device):
         velocity.assign(initial_velocity)
         stress.assign(initial_stress)
         delta.fill_(vec6(17.0))
-        with wp.ScopedCapture(device=device) as capture:
+        if wp.get_device(device).is_cuda:
+            with wp.ScopedCapture(device=device) as capture:
+                for color in range(3):
+                    command.set_param_at_index(0, color)
+                    command.launch()
+            wp.capture_launch(capture.graph)
+        else:
             for color in range(3):
                 command.set_param_at_index(0, color)
                 command.launch()
-        wp.capture_launch(capture.graph)
         for actual, expected in zip((velocity, stress, delta), result, strict=True):
             np.testing.assert_allclose(actual.numpy(), expected, atol=1e-6, rtol=1e-5)
         outputs.append(result)
@@ -2599,9 +2603,9 @@ add_function_test(
 
 add_function_test(
     TestImplicitMPM,
-    "test_cached_gs_matches_reference",
-    test_cached_gs_matches_reference,
-    devices=get_cuda_test_devices(),
+    "test_gs_eight_node_matches_generic",
+    test_gs_eight_node_matches_generic,
+    devices=devices,
 )
 
 if __name__ == "__main__":

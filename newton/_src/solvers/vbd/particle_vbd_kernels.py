@@ -2506,6 +2506,7 @@ def scatter_particle_body_contact_force_and_hessian(
 def make_solve_elasticity_tile(include_triangles: bool, include_tets: bool, two_particles_per_warp: bool):
     """Build the tiled per-particle elasticity kernel, specialized at code generation.
 
+    Tet-only models use a 96-thread packed force/Hessian reduction.
     One kernel source serves every tiled variant: ``include_triangles`` / ``include_tets``
     statically strip the triangle+edge or tetrahedron adjacency loops (the stripped
     code is absent from the generated kernel, matching a hand-specialized one), and
@@ -2513,6 +2514,11 @@ def make_solve_elasticity_tile(include_triangles: bool, include_tets: bool, two_
     32-thread warp, reducing with :func:`_warp_half_reduce_sum` to preserve the legacy
     16-lane reduction order bit for bit. Variants are memoized per flag combination.
     """
+
+    # Tet-only blocks reduce a packed symmetric Hessian across three warps.
+    cooperative_tets = include_tets and not include_triangles and not two_particles_per_warp
+    threads_per_particle = 96 if cooperative_tets else TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE
+    force_hessian9 = wp.types.vector(length=9, dtype=wp.float32)
 
     # _warp_half_reduce_sum hardcodes a width-16 shuffle ladder.
     assert TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE == 16
@@ -2544,8 +2550,8 @@ def make_solve_elasticity_tile(include_triangles: bool, include_tets: bool, two_
         particle_displacements: wp.array[wp.vec3],
     ):
         tid = wp.tid()
-        particle_slot = tid // TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE
-        thread_idx = tid % TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE
+        particle_slot = tid // wp.static(threads_per_particle)
+        thread_idx = tid % wp.static(threads_per_particle)
 
         particle_slot_valid = True
         if wp.static(two_particles_per_warp):
@@ -2562,7 +2568,7 @@ def make_solve_elasticity_tile(include_triangles: bool, include_tets: bool, two_
             )
 
         if wp.static(not two_particles_per_warp):
-            # Whole 16-lane block shares one particle: safe to retire inactive blocks early.
+            # Whole block shares one particle: safe to retire inactive blocks early.
             if not particle_is_dynamic:
                 if thread_idx == 0:
                     particle_displacements[particle_index] = wp.vec3(0.0)
@@ -2648,9 +2654,15 @@ def make_solve_elasticity_tile(include_triangles: bool, include_tets: bool, two_
                 if tet_indices.shape[0] > 0:
                     batch_counter = wp.int32(0)
                     num_adj_tets = get_vertex_num_adjacent_tets(particle_adjacency, particle_index)
-                    while batch_counter + thread_idx < num_adj_tets:
-                        adj_tet_counter = batch_counter + thread_idx
-                        batch_counter += TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE
+                    tet_lane = thread_idx
+                    if wp.static(cooperative_tets):
+                        tet_lane = thread_idx - 64
+                    while tet_lane >= 0 and batch_counter + tet_lane < num_adj_tets:
+                        adj_tet_counter = batch_counter + tet_lane
+                        if wp.static(cooperative_tets):
+                            batch_counter += 32
+                        else:
+                            batch_counter += TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE
                         nei_tet_index, vertex_order_on_tet = get_vertex_adjacent_tet_id_order(
                             particle_adjacency, particle_index, adj_tet_counter
                         )
@@ -2671,7 +2683,22 @@ def make_solve_elasticity_tile(include_triangles: bool, include_tets: bool, two_
                             f += f_tet
                             h += h_tet
 
-        if wp.static(two_particles_per_warp):
+        if wp.static(cooperative_tets):
+            packed = force_hessian9(f[0], f[1], f[2], h[0, 0], h[0, 1], h[0, 2], h[1, 1], h[1, 2], h[2, 2])
+            packed_sum = wp.tile_sum(wp.tile(packed, preserve_type=True))[0]
+            f_total = wp.vec3(packed_sum[0], packed_sum[1], packed_sum[2])
+            h_total = wp.mat33(
+                packed_sum[3],
+                packed_sum[4],
+                packed_sum[5],
+                packed_sum[4],
+                packed_sum[6],
+                packed_sum[7],
+                packed_sum[5],
+                packed_sum[7],
+                packed_sum[8],
+            )
+        elif wp.static(two_particles_per_warp):
             # The legacy 16-thread tile reduction uses the same 8,4,2,1 butterfly tree for lane
             # zero. Scalar shuffles retain that arithmetic order while allowing the two half-warps
             # to solve independent particles in one full warp.
@@ -2704,11 +2731,11 @@ def make_solve_elasticity_tile(include_triangles: bool, include_tets: bool, two_
                     particle_displacements[particle_index] = wp.vec3(0.0)
                     return
             dt_sqr_reciprocal = 1.0 / (dt * dt)
-            h_total = (
-                h_total
-                + mass[particle_index] * dt_sqr_reciprocal * wp.identity(n=3, dtype=float)
-                + particle_hessians[particle_index]
-            )
+            if wp.static(cooperative_tets):
+                inertia_scale = mass[particle_index] / (dt * dt)
+            else:
+                inertia_scale = mass[particle_index] * dt_sqr_reciprocal
+            h_total = h_total + inertia_scale * wp.identity(n=3, dtype=float) + particle_hessians[particle_index]
             if abs(wp.determinant(h_total)) > 1e-8:
                 h_inv = wp.inverse(h_total)
                 f_total = (

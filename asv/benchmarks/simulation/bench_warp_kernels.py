@@ -6,8 +6,9 @@
 import warp as wp
 from asv_runner.benchmarks.mark import SkipNotImplemented
 
+import newton.examples
 from newton.examples.mpm.example_mpm_multi_material import Example as MPMExample
-from newton.examples.softbody.example_softbody_hanging import Example as ElasticityExample
+from newton.examples.softbody.example_softbody_franka import Example as ElasticityExample
 from newton.viewer import ViewerNull
 
 
@@ -24,7 +25,8 @@ class WarpKernelExamples:
         if not wp.get_device().is_cuda:
             raise SkipNotImplemented
         example_class = ElasticityExample if example == "elasticity" else MPMExample
-        self.example = example_class(ViewerNull(num_frames=1000), example_class.create_parser().parse_args([]))
+        parser = example_class.create_parser() if example == "mpm" else newton.examples.create_parser()
+        self.example = example_class(ViewerNull(num_frames=1000), parser.parse_args([]))
         for _ in range(60):
             self.example.step()
         wp.synchronize_device()
