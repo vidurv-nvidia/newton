@@ -1120,6 +1120,7 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
         # or edge stiffness so the specialization is recomputed.
         self._tiled_elasticity_kernel = None
         self._tiled_elasticity_particles_per_block = 1
+        self._tiled_elasticity_threads_per_particle = TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE
         if self.use_particle_tile_solve:
             include_tets = model.tet_count > 0
             include_triangles = not _is_tet_only_elasticity_model(model)
@@ -1128,6 +1129,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 include_triangles, include_tets, two_particles_per_warp
             )
             self._tiled_elasticity_particles_per_block = 2 if two_particles_per_warp else 1
+            if include_tets and not include_triangles:
+                self._tiled_elasticity_threads_per_particle = 96
         if particle_enable_self_contact:
             self.particle_conservative_bounds = wp.zeros((model.particle_count,), dtype=float, device=self.device)
             self._self_contact_edge_edge_parallel_epsilon = particle_edge_parallel_epsilon
@@ -4139,8 +4142,8 @@ class SolverVBD(TendonStateMixin, SolverBase, CouplingInterface):
                 blocks = (particle_count_in_color + per_block - 1) // per_block
                 wp.launch(
                     kernel=self._tiled_elasticity_kernel,
-                    dim=blocks * per_block * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
-                    block_dim=per_block * TILE_SIZE_TRI_MESH_ELASTICITY_SOLVE,
+                    dim=blocks * per_block * self._tiled_elasticity_threads_per_particle,
+                    block_dim=per_block * self._tiled_elasticity_threads_per_particle,
                     inputs=[
                         dt,
                         self.model.particle_color_groups[color],

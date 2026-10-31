@@ -1224,6 +1224,31 @@ def fill_uniform_color_block_indices(
     color_indices[1, i] = (elem_idx + 1) * nodes_per_element
 
 
+def make_partition_color_block_indices_kernel(space_partition: fem.SpacePartition):
+    geo_partition = space_partition.geo_partition
+
+    @fem.cache.dynamic_kernel(suffix=space_partition.name)
+    def fill_partition_color_block_indices(
+        nodes_per_element: int,
+        geometry_arg: geo_partition.CellArg,
+        partition_arg: space_partition.PartitionArg,
+        color_indices: wp.array2d[int],
+    ):
+        i = wp.tid()
+        partition_cell = color_indices[0, i]
+        cell = geo_partition.cell_index(geometry_arg, partition_cell)
+        if cell == -1:
+            color_indices[0, i] = 0
+            color_indices[1, i] = 0
+            return
+        # Multi-environment node partitions reorder rows independently of cells.
+        first = space_partition.partition_node_index(partition_arg, cell * nodes_per_element)
+        color_indices[0, i] = first
+        color_indices[1, i] = first + nodes_per_element
+
+    return fill_partition_color_block_indices
+
+
 def make_dynamic_color_block_indices_kernel(geo_partition: fem.GeometryPartition):
     @fem.cache.dynamic_kernel(geo_partition.name)
     def fill_dynamic_color_block_indices(

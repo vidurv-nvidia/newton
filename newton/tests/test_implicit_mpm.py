@@ -12,7 +12,10 @@ import warp.fem as fem
 import warp.sparse as sp
 
 import newton
-from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import collision_weight_field
+from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import (
+    collision_weight_field,
+    make_partition_color_block_indices_kernel,
+)
 from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     _ALL_COLLIDER_WORLDS,
     Collider,
@@ -26,6 +29,8 @@ from newton._src.solvers.implicit_mpm.rheology_solver_kernels import (
     _symmetric_part_transposed_op,
     apply_stress_gs,
     compute_delassus_diagonal,
+    make_gs_solve_kernel,
+    mat13,
     mat55,
     mat66,
     postprocess_stress_and_strain,
@@ -2207,6 +2212,203 @@ basic_devices = get_test_devices(mode="basic")
 basic_cuda_devices = get_cuda_test_devices(mode="basic")
 
 
+def test_gs_eight_node_matches_generic(test, device):
+    """Preserve ordered updates, empty rows, duplicate nodes, and recorded color changes."""
+    rng = np.random.default_rng(61)
+    row_count, node_count = 7, 24
+    offsets = [0, 0, 8, 16, 24, 32, 40, 40]
+    # Blocks in the same color are independent; rows in each block share nodes.
+    columns = np.concatenate([np.arange(first, first + 8) for first in (0, 8, 8, 16, 16)]).astype(np.int32)
+    columns[7] = columns[6]
+    gradients = rng.normal(0, 0.1, (40, 3)).astype(np.float32)
+    initial_velocity = rng.normal(0, 0.2, (node_count, 3)).astype(np.float32)
+    initial_stress = rng.normal(0, 0.1, (row_count, 6)).astype(np.float32)
+    rotations = np.stack([np.linalg.qr(rng.normal(size=(5, 5)))[0] for _ in range(row_count)]).astype(np.float32)
+
+    def array(data, dtype):
+        return wp.array(np.asarray(data), dtype=dtype, device=device)
+
+    shared = [
+        array([0, 2, 2, 3], int),
+        array([[0, 2, 4], [2, 4, 7]], int),
+        array(np.tile([5.0, 1.0, 0.2, 0.5, 0.2, 0.1], (row_count, 1)), YieldParamVec),
+        array(np.linspace(0.7, 1.3, row_count), float),
+        wp.zeros(row_count + 1, dtype=int, device=device),
+        wp.empty(0, dtype=int, device=device),
+        wp.empty(0, dtype=mat66, device=device),
+        array(offsets, int),
+        array(columns, int),
+        array(gradients, mat13),
+        array(rng.uniform(0.5, 2.0, (row_count, 6)), vec6),
+        array(rotations, mat55),
+        array(rng.uniform(0.5, 2.0, node_count), float),
+        array(rng.normal(0, 0.3, (row_count, 6)), vec6),
+    ]
+    outputs = []
+    for kernel, workers, block_dim in [
+        (make_gs_solve_kernel(True, True, False), 64, 64),
+        (make_gs_solve_kernel(True, True, False, 8), 1, 4),
+        (make_gs_solve_kernel(True, True, False, 8), 4, 4),
+        (make_gs_solve_kernel(True, True, False, 8, use_cached_rows=True), 64, 32),
+    ]:
+        velocity = array(initial_velocity, wp.vec3)
+        stress = array(initial_stress, vec6)
+        delta = wp.full(row_count, vec6(17.0), dtype=vec6, device=device)
+        command = wp.launch(
+            kernel,
+            dim=workers,
+            block_dim=block_dim,
+            inputs=[0, workers, *shared],
+            outputs=[velocity, stress, delta],
+            device=device,
+            record_cmd=True,
+        )
+        for color in range(3):
+            command.set_param_at_index(0, color)
+            command.launch()
+        result = [value.numpy() for value in (velocity, stress, delta)]
+        # Empty rows retain stress and explicitly clear correction, including on replay.
+        np.testing.assert_array_equal(result[1][[0, 6]], initial_stress[[0, 6]])
+        np.testing.assert_array_equal(result[2][[0, 6]], np.zeros((2, 6)))
+        velocity.assign(initial_velocity)
+        stress.assign(initial_stress)
+        delta.fill_(vec6(17.0))
+        if wp.get_device(device).is_cuda:
+            with wp.ScopedCapture(device=device) as capture:
+                for color in range(3):
+                    command.set_param_at_index(0, color)
+                    command.launch()
+            wp.capture_launch(capture.graph)
+        else:
+            for color in range(3):
+                command.set_param_at_index(0, color)
+                command.launch()
+        for actual, expected in zip((velocity, stress, delta), result, strict=True):
+            np.testing.assert_allclose(actual.numpy(), expected, atol=1e-6, rtol=1e-5)
+        outputs.append(result)
+    for result in outputs[1:]:
+        for actual, expected in zip(result, outputs[0], strict=True):
+            np.testing.assert_allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+    # Reuse this fixture for every supported material mode and the cooperative route.
+    for viscosity, dilation, compliance, count in (
+        (False, False, False, -1),
+        (False, False, False, 8),
+        (False, True, True, 8),
+        (True, False, False, 8),
+    ):
+        with test.subTest(viscosity=viscosity, dilation=dilation, compliance=compliance, count=count):
+            inputs = list(shared)
+            if compliance:
+                inputs[4] = array(np.arange(row_count + 1, dtype=np.int32), int)
+                inputs[5] = array(np.arange(row_count, dtype=np.int32), int)
+                inputs[6] = array(np.tile(0.05 * np.eye(6), (row_count, 1, 1)), mat66)
+            variants = [
+                (make_gs_solve_kernel(viscosity, dilation, compliance), False),
+                (make_gs_solve_kernel(viscosity, dilation, compliance, count, use_cached_rows=True), False),
+            ]
+            if wp.get_device(device).is_cuda and count == -1:
+                variants.append(
+                    (make_gs_solve_kernel(False, False, False, -1, use_cached_rows=True, cooperative=True), True)
+                )
+            expected = None
+            for kernel, tiled in variants:
+                velocity = array(initial_velocity, wp.vec3)
+                stress = array(initial_stress, vec6)
+                delta = wp.full(row_count, vec6(17.0), dtype=vec6, device=device)
+                workers = 1 if tiled else 64
+                launch = wp.launch_tiled if tiled else wp.launch
+                command = launch(
+                    kernel,
+                    dim=[workers] if tiled else workers,
+                    block_dim=32,
+                    inputs=[0, workers, *inputs],
+                    outputs=[velocity, stress, delta],
+                    device=device,
+                    record_cmd=True,
+                )
+                for color in range(3):
+                    command.set_param_at_index(0, color)
+                    command.launch()
+                actual = [value.numpy() for value in (velocity, stress, delta)]
+                np.testing.assert_array_equal(actual[1][[0, 6]], initial_stress[[0, 6]])
+                np.testing.assert_array_equal(actual[2][[0, 6]], np.zeros((2, 6)))
+                if expected is None:
+                    expected = actual
+                else:
+                    for value, reference in zip(actual, expected, strict=True):
+                        np.testing.assert_allclose(value, reference, atol=1e-6, rtol=1e-5)
+                velocity.assign(initial_velocity)
+                stress.assign(initial_stress)
+                delta.fill_(vec6(17.0))
+                if wp.get_device(device).is_cuda:
+                    with wp.ScopedCapture(device=device) as capture:
+                        for color in range(3):
+                            command.set_param_at_index(0, color)
+                            command.launch()
+                    wp.capture_launch(capture.graph)
+                else:
+                    for color in range(3):
+                        command.set_param_at_index(0, color)
+                        command.launch()
+                for value, reference in zip((velocity, stress, delta), expected, strict=True):
+                    np.testing.assert_allclose(value.numpy(), reference, atol=1e-6, rtol=1e-5)
+    with test.assertRaisesRegex(ValueError, "does not support"):
+        make_gs_solve_kernel(True, True, False, use_cached_rows=True)
+    with test.assertRaisesRegex(ValueError, "requires the cached-row"):
+        make_gs_solve_kernel(False, False, False, cooperative=True)
+
+
+def test_gs_partition_coloring(test, device):
+    """Map DG rows through real partitions without parallel velocity-write conflicts."""
+    local = _make_mpm_particle_builder(dimensions=(4, 4, 4))
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverImplicitMPM.register_custom_attributes(builder)
+    for _ in range(8):
+        builder.add_world(local)
+    model = builder.finalize(device=device)
+    config = _make_mpm_config(solver="gs")
+    config.max_iterations = 1
+    solver = SolverImplicitMPM(model, config=config)
+    state_0, state_1 = model.state(), model.state()
+    with wp.ScopedDevice(device):
+        pic = solver._particles_to_cells(state_0.particle_q)
+        scratch = solver._rebuild_scratchpad(pic)
+        try:
+            solver._step_impl(state_0, state_1, 0.01, pic, scratch)
+            blocks = scratch.color_indices.numpy()
+            colors = scratch.color_offsets.numpy()
+            offsets = scratch.strain_matrix.offsets.numpy()
+            columns = scratch.strain_matrix.columns.numpy()
+            covered = []
+            for begin, end in itertools.pairwise(colors):
+                owners = set()
+                for first, last in blocks[:, int(begin) : int(end)].T:
+                    test.assertGreaterEqual(first, 0)
+                    test.assertLessEqual(first, last)
+                    test.assertLessEqual(last, scratch.strain_node_count)
+                    covered.extend(range(int(first), int(last)))
+                    nodes = set(columns[int(offsets[first]) : int(offsets[last])].tolist())
+                    test.assertTrue(owners.isdisjoint(nodes), "Same-color DG blocks must not share velocity nodes")
+                    owners.update(nodes)
+            np.testing.assert_array_equal(np.sort(covered), np.arange(scratch.strain_node_count))
+        finally:
+            scratch.release_temporaries()
+
+    # Full real partitions also accept the invalid-cell sentinel used by padding.
+    grid = fem.Grid3D(res=wp.vec3i(1, 1, 1))
+    space = fem.make_polynomial_space(grid, degree=0, discontinuous=True)
+    partition = fem.make_space_partition(space_topology=space.topology, device=device)
+    color_blocks = wp.array(np.array([[0, -1], [17, 17]], dtype=np.int32), dtype=int, device=device)
+    wp.launch(
+        make_partition_color_block_indices_kernel(partition),
+        dim=2,
+        inputs=[1, partition.geo_partition.cell_arg_value(device), partition.partition_arg_value(device), color_blocks],
+        device=device,
+    )
+    np.testing.assert_array_equal(color_blocks.numpy(), np.array([[0, 0], [1, 0]]))
+
+
 class TestImplicitMPM(unittest.TestCase):
     pass
 
@@ -2519,6 +2721,16 @@ add_function_test(
     devices=devices,
     check_output=False,
 )
+
+
+add_function_test(
+    TestImplicitMPM,
+    "test_gs_eight_node_matches_generic",
+    test_gs_eight_node_matches_generic,
+    devices=devices,
+)
+
+add_function_test(TestImplicitMPM, "test_gs_partition_coloring", test_gs_partition_coloring, devices=devices)
 
 
 if __name__ == "__main__":

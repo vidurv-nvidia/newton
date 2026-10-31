@@ -980,21 +980,524 @@ def make_jacobi_solve_kernel(
     return jacobi_solve_kernel_impl
 
 
+# Private row cache types used by the generated GS arithmetic below.
+_gs_vec24 = wp.types.vector(length=24, dtype=wp.float32)
+_gs_vec8 = wp.types.vector(length=8, dtype=wp.float32)
+_gs_int8 = wp.types.vector(length=8, dtype=wp.int32)
+
+
+@wp.func(inline=True)
+def _gs_strain_product(gradient: wp.vec3, velocity: wp.vec3):
+    return fem.SymmetricTensorMapper.value_to_dof_3d(wp.outer(velocity, gradient * 2.0))
+
+
+@wp.func(inline=True)
+def _gs_stress_product(gradient: wp.vec3, stress: vec6):
+    return fem.SymmetricTensorMapper.dof_to_value_3d(stress) @ gradient
+
+
+@wp.func(inline=True)
+def _gs_to_local(value: vec6, rotation: mat55):
+    result = vec6(value[0])
+    result[1:6] = value[1:6] @ rotation
+    return result
+
+
+@wp.func(inline=True)
+def _gs_to_world(value: vec6, rotation: mat55):
+    result = vec6(value[0])
+    result[1:6] = rotation @ value[1:6]
+    return result
+
+
+@wp.func(inline=True)
+def _gs_yield_bounds(parameters: vec6, normal: float):
+    lower = -wp.max(0.0, parameters[1])
+    upper = parameters[0]
+    friction = wp.where(upper > 0.0, wp.max(0.0, parameters[3] / upper), 0.0)
+    cohesion = wp.max(parameters[2], 0.0)
+    normal = wp.clamp(normal, lower, upper)
+    left = lower + 0.5 * upper
+    right = 0.5 * upper
+    if normal < left:
+        return cohesion + friction * (normal - lower), friction, lower, left
+    elif normal > right:
+        return cohesion + friction * (upper - normal), -friction, right, upper
+    return cohesion + friction * right, 0.0, left, right
+
+
+@wp.func(inline=True)
+def _gs_sliding_uncoupled(diagonal: vec6, rhs: vec6, strength: float):
+    tangent = rhs
+    tangent[0] = 0.0
+    if strength <= 0.0:
+        return tangent
+    scaled = diagonal * strength
+    lower = wp.max(0.0, wp.length(tangent) - wp.max(scaled))
+    upper = wp.length(tangent) - wp.min(scaled)
+    alpha = lower
+    for _iteration in range(24):
+        denominator = scaled + vec6(alpha)
+        residual = wp.cw_div(tangent, denominator)
+        magnitude = wp.length(residual)
+        value = magnitude - 1.0
+        derivative = wp.dot(residual, -wp.cw_div(residual, denominator * magnitude))
+        increment = wp.min(-value / derivative, upper - alpha)
+        if increment < 1.0e-7 * upper:
+            break
+        alpha += increment
+    result = wp.cw_div(tangent * alpha, scaled + vec6(alpha))
+    result[0] = 0.0
+    return result
+
+
+@wp.func(inline=True)
+def _gs_sliding_coupled(diagonal: vec6, rhs: vec6, strength: float, slope: float, dilatancy: float):
+    strength -= slope * rhs[0] / diagonal[0]
+    tangent = rhs
+    tangent[0] = 0.0
+    magnitude = wp.length(tangent)
+    coupling = dilatancy * slope * slope / diagonal[0]
+    scale = strength + coupling * magnitude
+    if scale <= 0.0:
+        return tangent
+    scaled = diagonal * scale
+    coupling = coupling / scale
+    target = strength / scale
+    first = magnitude - wp.max(scaled) * target
+    last = magnitude - wp.min(scaled) * target
+    root = 1.0 / coupling
+    if target > 0.0:
+        lower = wp.max(0.0, first)
+        upper = wp.min(last, root)
+    elif target < 0.0:
+        lower = wp.max(last, root)
+        upper = first
+    else:
+        lower = root
+        upper = root
+    alpha = lower
+    for _iteration in range(24):
+        denominator = scaled + vec6(alpha)
+        residual = wp.cw_div(tangent, denominator)
+        norm = wp.length(residual)
+        derivative_vector = -wp.cw_div(residual, denominator * norm)
+        factor = 1.0 - coupling * alpha
+        value = norm * factor - target
+        derivative = wp.dot(residual, derivative_vector) * factor - norm * coupling
+        increment = wp.min(-value / derivative, upper - alpha)
+        if increment < 1.0e-7 * upper:
+            break
+        alpha += increment
+    result = wp.cw_div(tangent * alpha, scaled + vec6(alpha))
+    result[0] = dilatancy * slope * wp.length(result)
+    return result
+
+
+@wp.func(inline=True)
+def _gs_flow_rule(diagonal: vec6, rhs: vec6, parameters: vec6, volume: float, viscosity: bool, dilation: bool):
+    theta = float(0.0)
+    if dilation:
+        theta = wp.clamp(parameters[4], 0.0, 1.0)
+    if viscosity:
+        viscous = vec6(1.0) + wp.max(0.0, parameters[5]) / volume * diagonal
+        diagonal = wp.cw_div(diagonal, viscous)
+        rhs = wp.cw_div(rhs, viscous)
+    free_stress = -wp.cw_div(rhs, diagonal)
+    normal = free_stress[0]
+    strength, slope, lower, upper = _gs_yield_bounds(parameters, normal)
+    normal_velocity = diagonal[0] * (wp.clamp(normal, lower, upper) - normal)
+    tangent = free_stress
+    tangent[0] = 0.0
+    if wp.length(tangent) <= strength:
+        result = vec6(0.0)
+        result[0] = normal_velocity
+        return result
+    result = rhs
+    result[0] = normal_velocity
+    if dilation:
+        result = _gs_sliding_coupled(diagonal, result, strength, slope, theta)
+    else:
+        result = _gs_sliding_uncoupled(diagonal, result, strength)
+    new_normal = (result[0] - rhs[0]) / diagonal[0]
+    clamped = wp.clamp(new_normal, lower, upper)
+    if clamped == new_normal:
+        return result
+    strength, slope, lower, upper = _gs_yield_bounds(parameters, clamped)
+    if dilation:
+        result = _gs_sliding_coupled(diagonal, rhs, strength, 0.0, theta)
+    else:
+        result = _gs_sliding_uncoupled(diagonal, rhs, strength)
+    result[0] = diagonal[0] * (clamped - normal)
+    return result
+
+
+@wp.func(inline=True)
+def _gs_solve_rows(
+    worker: int,
+    color: int,
+    workers: int,
+    color_offsets: wp.array[int],
+    blocks: wp.array2d[int],
+    parameters: wp.array[vec6],
+    volume: wp.array[float],
+    compliance_offsets: wp.array[int],
+    compliance_columns: wp.array[int],
+    compliance_values: wp.array[mat66],
+    offsets: wp.array[int],
+    columns: wp.array[int],
+    gradients: wp.array[wp.vec3],
+    diagonal: wp.array[vec6],
+    rotation: wp.array[mat55],
+    inverse_mass: wp.array[float],
+    rhs: wp.array[vec6],
+    velocity: wp.array[wp.vec3],
+    stress: wp.array[vec6],
+    correction: wp.array[vec6],
+    viscosity: bool,
+    dilation: bool,
+    compliance: bool,
+    fixed: bool,
+):
+    first = color_offsets[color] + worker
+    last = color_offsets[color + 1]
+    for block in range(first, last, workers):
+        start = blocks[0, block]
+        stop = blocks[1, block]
+        for row in range(start, stop):
+            begin = offsets[row]
+            end = offsets[row + 1]
+            if begin == end:
+                correction[row] = vec6(0.0)
+                continue
+            strain = rhs[row]
+            saved_gradients = _gs_vec24(0.0)
+            saved_columns = _gs_int8(0)
+            saved_masses = _gs_vec8(0.0)
+            saved_velocities = _gs_vec24(0.0)
+            ordered_columns = bool(True)
+            previous_column = int(-1)
+            cache_row = fixed or end - begin == 8
+            if cache_row:
+                for neighbor in range(8):
+                    edge = begin + neighbor
+                    node = columns[edge]
+                    gradient = gradients[edge]
+                    node_velocity = velocity[node]
+                    if node <= previous_column:
+                        ordered_columns = False
+                    previous_column = node
+                    saved_columns[neighbor] = node
+                    saved_masses[neighbor] = inverse_mass[node]
+                    saved_gradients[3 * neighbor] = gradient[0]
+                    saved_gradients[3 * neighbor + 1] = gradient[1]
+                    saved_gradients[3 * neighbor + 2] = gradient[2]
+                    saved_velocities[3 * neighbor] = node_velocity[0]
+                    saved_velocities[3 * neighbor + 1] = node_velocity[1]
+                    saved_velocities[3 * neighbor + 2] = node_velocity[2]
+                    strain += _gs_strain_product(gradient, node_velocity)
+            else:
+                for edge in range(begin, end):
+                    node = columns[edge]
+                    strain += _gs_strain_product(gradients[edge], velocity[node])
+            if compliance:
+                for edge in range(compliance_offsets[row], compliance_offsets[row + 1]):
+                    strain += compliance_values[edge] @ stress[compliance_columns[edge]]
+            basis = rotation[row]
+            local_strain = _gs_to_local(strain, basis)
+            local_stress = _gs_to_local(stress[row], basis)
+            scale = diagonal[row]
+            result = _gs_flow_rule(
+                scale, local_strain - wp.cw_mul(local_stress, scale), parameters[row], volume[row], viscosity, dilation
+            )
+            delta = _gs_to_world(wp.cw_div(result - local_strain, scale), basis)
+            stress[row] += delta
+            correction[row] = delta
+            if cache_row:
+                for neighbor in range(8):
+                    node = saved_columns[neighbor]
+                    gradient = wp.vec3(
+                        saved_gradients[3 * neighbor],
+                        saved_gradients[3 * neighbor + 1],
+                        saved_gradients[3 * neighbor + 2],
+                    )
+                    change = saved_masses[neighbor] * _gs_stress_product(gradient, delta)
+                    if ordered_columns:
+                        old_velocity = wp.vec3(
+                            saved_velocities[3 * neighbor],
+                            saved_velocities[3 * neighbor + 1],
+                            saved_velocities[3 * neighbor + 2],
+                        )
+                        velocity[node] = old_velocity + change
+                    else:
+                        velocity[node] += change
+            else:
+                for edge in range(begin, end):
+                    node = columns[edge]
+                    change = inverse_mass[node] * _gs_stress_product(gradients[edge], delta)
+                    velocity[node] += change
+
+
+def _use_cached_gs(has_viscosity, has_dilatancy, has_compliance_mat, strain_velocity_node_count, has_rotation=True):
+    """Select only the generated material modes with their qualified flow model."""
+    return (
+        not _USE_CAM_CLAY
+        and not _ISOTROPIC_LOCAL_LHS
+        and _SLIDING_NEWTON_TOL == 1.0e-7
+        and (has_viscosity, has_dilatancy, has_compliance_mat, strain_velocity_node_count, has_rotation)
+        in (
+            (False, False, False, -1, True),
+            (False, False, False, 8, True),
+            (False, True, True, 8, True),
+            (True, False, False, 8, True),
+            (True, True, False, 8, True),
+        )
+    )
+
+
 def make_gs_solve_kernel(
     has_viscosity: bool,
     has_dilatancy: bool,
     has_compliance_mat: bool,
     strain_velocity_node_count: int = -1,
     has_rotation: bool = not _ISOTROPIC_LOCAL_LHS,
+    *,
+    use_cached_rows: bool = False,
+    cooperative: bool = False,
 ):
     """Return a Gauss-Seidel colored-block stress solve kernel specialized for the given feature flags.
 
     The returned kernel processes strain nodes in color order to avoid write conflicts,
     immediately propagating velocity updates within each color. Each unique combination
     of flags produces a separate Warp kernel compiled and cached via
-    :func:`fem.cache.dynamic_kernel`.
+    :func:`fem.cache.dynamic_kernel`. The default preserves generic material and
+    CPU behavior. Internal CUDA callers may opt into the qualified row cache;
+    cooperative mode additionally requires a tiled launch with block size 32.
     """
+    if cooperative and not use_cached_rows:
+        raise ValueError("Cooperative GS requires the cached-row path")
+    if use_cached_rows:
+        if not _use_cached_gs(
+            has_viscosity, has_dilatancy, has_compliance_mat, strain_velocity_node_count, has_rotation
+        ):
+            raise ValueError("Cached GS does not support this material or flow model")
+        if cooperative and (has_viscosity or has_dilatancy or has_compliance_mat or strain_velocity_node_count != -1):
+            raise ValueError("Cooperative GS requires noncompliant dynamic rows without viscosity or dilatancy")
+        cached_key = (
+            has_viscosity,
+            has_dilatancy,
+            has_compliance_mat,
+            has_rotation,
+            strain_velocity_node_count,
+            cooperative,
+            "cached32",
+        )
+        if cooperative:
+
+            @fem.cache.dynamic_kernel(suffix=cached_key, kernel_options={"fast_math": True, "block_dim": 32})
+            def gs_solve_cached_cooperative(
+                color: int,
+                workers: int,
+                color_offsets: wp.array[int],
+                blocks: wp.array2d[int],
+                parameters: wp.array[vec6],
+                volume: wp.array[float],
+                compliance_offsets: wp.array[int],
+                compliance_columns: wp.array[int],
+                compliance_values: wp.array[mat66],
+                offsets: wp.array[int],
+                columns: wp.array[int],
+                gradients: wp.array[wp.vec3],
+                diagonal: wp.array[vec6],
+                rotation: wp.array[mat55],
+                inverse_mass: wp.array[float],
+                rhs: wp.array[vec6],
+                velocity: wp.array[wp.vec3],
+                stress: wp.array[vec6],
+                correction: wp.array[vec6],
+            ):
+                group, lane = wp.tid()
+                first = color_offsets[color] + group
+                last = color_offsets[color + 1]
+                for block in range(first, last, workers):
+                    start = blocks[0, block]
+                    stop = blocks[1, block]
+                    for row in range(start, stop):
+                        bounds_tile = wp.tile_from_thread(
+                            shape=(1,), value=wp.vec2i(offsets[row], offsets[row + 1]), thread_idx=0
+                        )
+                        bounds = wp.tile_extract(bounds_tile, 0)
+                        begin = bounds[0]
+                        end = bounds[1]
+                        if begin == end:
+                            if lane == 0:
+                                correction[row] = vec6(0.0)
+                            continue
+                        strain = vec6(0.0)
+                        if lane == 0:
+                            strain = rhs[row]
+                        for chunk_begin in range(begin, end, 32):
+                            edge = chunk_begin + lane
+                            raw = vec6(0.0)
+                            if edge < end:
+                                node = columns[edge]
+                                gradient = gradients[edge]
+                                node_velocity = velocity[node]
+                                raw = vec6(
+                                    gradient[0],
+                                    gradient[1],
+                                    gradient[2],
+                                    node_velocity[0],
+                                    node_velocity[1],
+                                    node_velocity[2],
+                                )
+                            raw_tile = wp.tile(raw, preserve_type=True)
+                            count = wp.min(32, end - chunk_begin)
+                            for entry in range(count):
+                                value = wp.tile_extract(raw_tile, entry)
+                                if lane == 0:
+                                    row_gradient = wp.vec3(value[0], value[1], value[2])
+                                    row_velocity = wp.vec3(value[3], value[4], value[5])
+                                    strain += _gs_strain_product(row_gradient, row_velocity)
+                        delta = vec6(0.0)
+                        if lane == 0:
+                            basis = rotation[row]
+                            local_strain = _gs_to_local(strain, basis)
+                            local_stress = _gs_to_local(stress[row], basis)
+                            scale = diagonal[row]
+                            result = _gs_flow_rule(
+                                scale,
+                                local_strain - wp.cw_mul(local_stress, scale),
+                                parameters[row],
+                                volume[row],
+                                False,
+                                False,
+                            )
+                            delta = _gs_to_world(wp.cw_div(result - local_strain, scale), basis)
+                            stress[row] += delta
+                            correction[row] = delta
+                        delta_tile = wp.tile_from_thread(shape=(1,), value=delta, thread_idx=0)
+                        shared_delta = wp.tile_extract(delta_tile, 0)
+                        row_length = end - begin
+                        parallel_scatter = bool(False)
+                        first_node = int(-1)
+                        second_node = int(-1)
+                        second_position = lane + 32
+                        if row_length <= 64:
+                            if lane < row_length:
+                                first_node = columns[begin + lane]
+                            if second_position < row_length:
+                                second_node = columns[begin + second_position]
+                            first_nodes = wp.tile(first_node)
+                            second_nodes = wp.tile(second_node)
+                            previous_lane = (lane + 31) % 32
+                            first_previous = wp.tile_extract(first_nodes, previous_lane)
+                            second_previous = wp.tile_extract(second_nodes, previous_lane)
+                            if lane == 0:
+                                second_previous = first_previous
+                            violations = int(0)
+                            if lane > 0 and lane < row_length and first_node <= first_previous:
+                                violations += 1
+                            if second_position < row_length and second_node <= second_previous:
+                                violations += 1
+                            violations_tile = wp.tile(violations)
+                            violation_total = wp.tile_sum(violations_tile)
+                            violation_count = wp.tile_extract(violation_total, 0)
+                            if violation_count == 0:
+                                parallel_scatter = True
+                            else:
+                                duplicates = int(0)
+                                for earlier in range(wp.min(32, row_length)):
+                                    earlier_node = wp.tile_extract(first_nodes, earlier)
+                                    if lane < row_length and earlier < lane and first_node == earlier_node:
+                                        duplicates += 1
+                                    if (
+                                        second_position < row_length
+                                        and earlier < second_position
+                                        and second_node == earlier_node
+                                    ):
+                                        duplicates += 1
+                                for earlier in range(wp.max(0, row_length - 32)):
+                                    earlier_node = wp.tile_extract(second_nodes, earlier)
+                                    if second_position < row_length and earlier < lane and second_node == earlier_node:
+                                        duplicates += 1
+                                duplicates_tile = wp.tile(duplicates)
+                                duplicate_total = wp.tile_sum(duplicates_tile)
+                                duplicate_count = wp.tile_extract(duplicate_total, 0)
+                                parallel_scatter = duplicate_count == 0
+                        if parallel_scatter:
+                            if lane < row_length:
+                                edge = begin + lane
+                                change = inverse_mass[first_node] * _gs_stress_product(gradients[edge], shared_delta)
+                                velocity[first_node] += change
+                            if second_position < row_length:
+                                edge = begin + second_position
+                                change = inverse_mass[second_node] * _gs_stress_product(gradients[edge], shared_delta)
+                                velocity[second_node] += change
+                        elif lane == 0:
+                            for edge in range(begin, end):
+                                node = columns[edge]
+                                change = inverse_mass[node] * _gs_stress_product(gradients[edge], shared_delta)
+                                velocity[node] += change
+
+            return gs_solve_cached_cooperative
+
+        @fem.cache.dynamic_kernel(suffix=cached_key, kernel_options={"fast_math": True, "block_dim": 32})
+        def gs_solve_cached(
+            color: int,
+            workers: int,
+            color_offsets: wp.array[int],
+            blocks: wp.array2d[int],
+            parameters: wp.array[vec6],
+            volume: wp.array[float],
+            compliance_offsets: wp.array[int],
+            compliance_columns: wp.array[int],
+            compliance_values: wp.array[mat66],
+            offsets: wp.array[int],
+            columns: wp.array[int],
+            gradients: wp.array[wp.vec3],
+            diagonal: wp.array[vec6],
+            rotation: wp.array[mat55],
+            inverse_mass: wp.array[float],
+            rhs: wp.array[vec6],
+            velocity: wp.array[wp.vec3],
+            stress: wp.array[vec6],
+            correction: wp.array[vec6],
+        ):
+            _gs_solve_rows(
+                wp.tid(),
+                color,
+                workers,
+                color_offsets,
+                blocks,
+                parameters,
+                volume,
+                compliance_offsets,
+                compliance_columns,
+                compliance_values,
+                offsets,
+                columns,
+                gradients,
+                diagonal,
+                rotation,
+                inverse_mass,
+                rhs,
+                velocity,
+                stress,
+                correction,
+                wp.static(has_viscosity),
+                wp.static(has_dilatancy),
+                wp.static(has_compliance_mat),
+                wp.static(strain_velocity_node_count == 8),
+            )
+
+        return gs_solve_cached
+
     key = (has_viscosity, has_dilatancy, has_compliance_mat, has_rotation, strain_velocity_node_count)
+    cache_row_data = has_viscosity and has_dilatancy and not has_compliance_mat and strain_velocity_node_count == 8
+    nodes8 = wp.types.vector(length=8, dtype=wp.int32)
+    mass8 = wp.types.vector(length=8, dtype=wp.float32)
+    gradients8 = wp.types.matrix(shape=(8, 3), dtype=wp.float32)
 
     @fem.cache.dynamic_kernel(suffix=key, kernel_options={"fast_math": True})
     def gs_solve_kernel_impl(
@@ -1029,18 +1532,34 @@ def make_gs_solve_kernel(
                     delta_correction[tau_i] = vec6(0.0)
                     continue
 
-                local_strain = wp.static(make_compute_local_strain(has_compliance_mat, strain_velocity_node_count))(
-                    tau_i,
-                    compliance_mat_offsets,
-                    compliance_mat_columns,
-                    compliance_mat_values,
-                    strain_mat_offsets,
-                    strain_mat_columns,
-                    strain_mat_values,
-                    local_strain_rhs,
-                    velocities,
-                    local_stress,
-                )
+                if wp.static(cache_row_data):
+                    # Retain row metadata for the ordered velocity scatter below.
+                    offset = strain_mat_offsets[tau_i]
+                    local_strain = local_strain_rhs[tau_i]
+                    nodes = nodes8(0)
+                    gradients = gradients8(0.0)
+                    masses = mass8(0.0)
+                    for corner in range(8):
+                        entry = offset + corner
+                        node = strain_mat_columns[entry]
+                        gradient = strain_mat_values[entry]
+                        nodes[corner] = node
+                        gradients[corner] = gradient
+                        masses[corner] = inv_mass_matrix[node]
+                        local_strain += _symmetric_part_op(gradient, velocities[node])
+                else:
+                    local_strain = wp.static(make_compute_local_strain(has_compliance_mat, strain_velocity_node_count))(
+                        tau_i,
+                        compliance_mat_offsets,
+                        compliance_mat_columns,
+                        compliance_mat_values,
+                        strain_mat_offsets,
+                        strain_mat_columns,
+                        strain_mat_values,
+                        local_strain_rhs,
+                        velocities,
+                        local_stress,
+                    )
 
                 delta_stress = wp.static(make_solve_local_stress(has_viscosity, has_dilatancy, has_rotation))(
                     tau_i,
@@ -1055,15 +1574,22 @@ def make_gs_solve_kernel(
                 local_stress[tau_i] += delta_stress
                 delta_correction[tau_i] = delta_stress
 
-                wp.static(make_apply_stress_delta(strain_velocity_node_count))(
-                    tau_i,
-                    delta_stress,
-                    strain_mat_offsets,
-                    strain_mat_columns,
-                    strain_mat_values,
-                    inv_mass_matrix,
-                    velocities,
-                )
+                if wp.static(cache_row_data):
+                    # Sequential updates preserve repeated node indices within a row.
+                    for corner in range(8):
+                        velocities[nodes[corner]] += masses[corner] * _symmetric_part_transposed_op(
+                            gradients[corner], delta_stress
+                        )
+                else:
+                    wp.static(make_apply_stress_delta(strain_velocity_node_count))(
+                        tau_i,
+                        delta_stress,
+                        strain_mat_offsets,
+                        strain_mat_columns,
+                        strain_mat_values,
+                        inv_mass_matrix,
+                        velocities,
+                    )
 
     return gs_solve_kernel_impl
 
