@@ -71,6 +71,7 @@ from .implicit_mpm_solver_kernels import (
     make_cell_color_kernel,
     make_dynamic_color_block_indices_kernel,
     make_inverse_rotate_vectors,
+    make_partition_color_block_indices_kernel,
     make_rotate_vectors,
     mark_active_cells,
     mark_active_cells_by_environment,
@@ -3916,6 +3917,17 @@ class SolverImplicitMPM(SolverBase, CouplingInterface):
                 make_dynamic_color_block_indices_kernel(space_partition.geo_partition),
                 dim=colored_element_count,
                 inputs=[partition_arg, pic.cell_particle_offsets, scratch.color_indices],
+            )
+        elif is_dg:
+            wp.launch(
+                make_partition_color_block_indices_kernel(space_partition),
+                dim=colored_element_count,
+                inputs=[
+                    nodes_per_color_element,
+                    partition_arg,
+                    space_partition.partition_arg_value(scratch.color_indices.device),
+                    scratch.color_indices,
+                ],
             )
         else:
             wp.launch(

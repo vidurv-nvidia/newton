@@ -12,7 +12,10 @@ import warp.fem as fem
 import warp.sparse as sp
 
 import newton
-from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import collision_weight_field
+from newton._src.solvers.implicit_mpm.implicit_mpm_solver_kernels import (
+    collision_weight_field,
+    make_partition_color_block_indices_kernel,
+)
 from newton._src.solvers.implicit_mpm.rasterized_collisions import (
     _ALL_COLLIDER_WORLDS,
     Collider,
@@ -2287,6 +2290,56 @@ def test_gs_eight_node_matches_generic(test, device):
             np.testing.assert_allclose(actual, expected, atol=1e-6, rtol=1e-5)
 
 
+def test_gs_partition_coloring(test, device):
+    """Map DG rows through real partitions without parallel velocity-write conflicts."""
+    local = _make_mpm_particle_builder(dimensions=(4, 4, 4))
+    builder = newton.ModelBuilder(up_axis=newton.Axis.Y)
+    SolverImplicitMPM.register_custom_attributes(builder)
+    for _ in range(8):
+        builder.add_world(local)
+    model = builder.finalize(device=device)
+    config = _make_mpm_config(solver="gs")
+    config.max_iterations = 1
+    solver = SolverImplicitMPM(model, config=config)
+    state_0, state_1 = model.state(), model.state()
+    with wp.ScopedDevice(device):
+        pic = solver._particles_to_cells(state_0.particle_q)
+        scratch = solver._rebuild_scratchpad(pic)
+        try:
+            solver._step_impl(state_0, state_1, 0.01, pic, scratch)
+            blocks = scratch.color_indices.numpy()
+            colors = scratch.color_offsets.numpy()
+            offsets = scratch.strain_matrix.offsets.numpy()
+            columns = scratch.strain_matrix.columns.numpy()
+            covered = []
+            for begin, end in itertools.pairwise(colors):
+                owners = set()
+                for first, last in blocks[:, int(begin) : int(end)].T:
+                    test.assertGreaterEqual(first, 0)
+                    test.assertLessEqual(first, last)
+                    test.assertLessEqual(last, scratch.strain_node_count)
+                    covered.extend(range(int(first), int(last)))
+                    nodes = set(columns[int(offsets[first]) : int(offsets[last])].tolist())
+                    test.assertTrue(owners.isdisjoint(nodes), "Same-color DG blocks must not share velocity nodes")
+                    owners.update(nodes)
+            np.testing.assert_array_equal(np.sort(covered), np.arange(scratch.strain_node_count))
+        finally:
+            scratch.release_temporaries()
+
+    # Full real partitions also accept the invalid-cell sentinel used by padding.
+    grid = fem.Grid3D(res=wp.vec3i(1, 1, 1))
+    space = fem.make_polynomial_space(grid, degree=0, discontinuous=True)
+    partition = fem.make_space_partition(space_topology=space.topology, device=device)
+    color_blocks = wp.array(np.array([[0, -1], [17, 17]], dtype=np.int32), dtype=int, device=device)
+    wp.launch(
+        make_partition_color_block_indices_kernel(partition),
+        dim=2,
+        inputs=[1, partition.geo_partition.cell_arg_value(device), partition.partition_arg_value(device), color_blocks],
+        device=device,
+    )
+    np.testing.assert_array_equal(color_blocks.numpy(), np.array([[0, 0], [1, 0]]))
+
+
 class TestImplicitMPM(unittest.TestCase):
     pass
 
@@ -2607,6 +2660,9 @@ add_function_test(
     test_gs_eight_node_matches_generic,
     devices=devices,
 )
+
+add_function_test(TestImplicitMPM, "test_gs_partition_coloring", test_gs_partition_coloring, devices=devices)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2, failfast=True)
