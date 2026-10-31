@@ -1,1 +1,1 @@
-Optimize the existing CUDA tetrahedral VBD tiled elasticity and eight-node viscous, dilatant MPM Gauss–Seidel kernels in place. Solver options and example configurations remain unchanged.
+Optimize the existing CUDA tetrahedral VBD tiled elasticity kernel and extend cached MPM Gauss–Seidel row updates across supported CUDA material modes. Preserve generic CPU and material paths, solver options, and example configurations.

@@ -2249,6 +2249,7 @@ def test_gs_eight_node_matches_generic(test, device):
         (make_gs_solve_kernel(True, True, False), 64, 64),
         (make_gs_solve_kernel(True, True, False, 8), 1, 4),
         (make_gs_solve_kernel(True, True, False, 8), 4, 4),
+        (make_gs_solve_kernel(True, True, False, 8, use_cached_rows=True), 64, 32),
     ]:
         velocity = array(initial_velocity, wp.vec3)
         stress = array(initial_stress, vec6)
@@ -2288,6 +2289,74 @@ def test_gs_eight_node_matches_generic(test, device):
     for result in outputs[1:]:
         for actual, expected in zip(result, outputs[0], strict=True):
             np.testing.assert_allclose(actual, expected, atol=1e-6, rtol=1e-5)
+
+    # Reuse this fixture for every supported material mode and the cooperative route.
+    for viscosity, dilation, compliance, count in (
+        (False, False, False, -1),
+        (False, False, False, 8),
+        (False, True, True, 8),
+        (True, False, False, 8),
+    ):
+        with test.subTest(viscosity=viscosity, dilation=dilation, compliance=compliance, count=count):
+            inputs = list(shared)
+            if compliance:
+                inputs[4] = array(np.arange(row_count + 1, dtype=np.int32), int)
+                inputs[5] = array(np.arange(row_count, dtype=np.int32), int)
+                inputs[6] = array(np.tile(0.05 * np.eye(6), (row_count, 1, 1)), mat66)
+            variants = [
+                (make_gs_solve_kernel(viscosity, dilation, compliance), False),
+                (make_gs_solve_kernel(viscosity, dilation, compliance, count, use_cached_rows=True), False),
+            ]
+            if wp.get_device(device).is_cuda and count == -1:
+                variants.append(
+                    (make_gs_solve_kernel(False, False, False, -1, use_cached_rows=True, cooperative=True), True)
+                )
+            expected = None
+            for kernel, tiled in variants:
+                velocity = array(initial_velocity, wp.vec3)
+                stress = array(initial_stress, vec6)
+                delta = wp.full(row_count, vec6(17.0), dtype=vec6, device=device)
+                workers = 1 if tiled else 64
+                launch = wp.launch_tiled if tiled else wp.launch
+                command = launch(
+                    kernel,
+                    dim=[workers] if tiled else workers,
+                    block_dim=32,
+                    inputs=[0, workers, *inputs],
+                    outputs=[velocity, stress, delta],
+                    device=device,
+                    record_cmd=True,
+                )
+                for color in range(3):
+                    command.set_param_at_index(0, color)
+                    command.launch()
+                actual = [value.numpy() for value in (velocity, stress, delta)]
+                np.testing.assert_array_equal(actual[1][[0, 6]], initial_stress[[0, 6]])
+                np.testing.assert_array_equal(actual[2][[0, 6]], np.zeros((2, 6)))
+                if expected is None:
+                    expected = actual
+                else:
+                    for value, reference in zip(actual, expected, strict=True):
+                        np.testing.assert_allclose(value, reference, atol=1e-6, rtol=1e-5)
+                velocity.assign(initial_velocity)
+                stress.assign(initial_stress)
+                delta.fill_(vec6(17.0))
+                if wp.get_device(device).is_cuda:
+                    with wp.ScopedCapture(device=device) as capture:
+                        for color in range(3):
+                            command.set_param_at_index(0, color)
+                            command.launch()
+                    wp.capture_launch(capture.graph)
+                else:
+                    for color in range(3):
+                        command.set_param_at_index(0, color)
+                        command.launch()
+                for value, reference in zip((velocity, stress, delta), expected, strict=True):
+                    np.testing.assert_allclose(value.numpy(), reference, atol=1e-6, rtol=1e-5)
+    with test.assertRaisesRegex(ValueError, "does not support"):
+        make_gs_solve_kernel(True, True, False, use_cached_rows=True)
+    with test.assertRaisesRegex(ValueError, "requires the cached-row"):
+        make_gs_solve_kernel(False, False, False, cooperative=True)
 
 
 def test_gs_partition_coloring(test, device):

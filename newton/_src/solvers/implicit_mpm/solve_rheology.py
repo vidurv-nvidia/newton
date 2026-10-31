@@ -28,6 +28,7 @@ from .contact_solver_kernels import (
 )
 from .rheology_solver_kernels import (
     YieldParamVec,
+    _use_cached_gs,
     apply_stress_delta_jacobi,
     apply_stress_gs,
     apply_velocity_delta,
@@ -728,30 +729,57 @@ class _GaussSeidelSolver(_RheologySolver):
             record_cmd=True,
         )
 
-        # Solve kernel
+        # Keep the generic factory path for CPU and other material/development modes.
+        use_cached_rows = self.device.is_cuda and _use_cached_gs(
+            self.rheology.has_viscosity,
+            self.rheology.has_dilatancy,
+            self.rheology.compliance_mat.nnz > 0,
+            self.rheology.strain_velocity_node_count,
+        )
+        cooperative = False
+        launch = wp.launch
+        if use_cached_rows:
+            # Preserve the generated shape-only policy, including the native SM cap.
+            average = (self.rheology.color_blocks.shape[1] + max(1, self.color_count) - 1) // max(1, self.color_count)
+            cooperative = (
+                self.rheology.strain_velocity_node_count == -1
+                and self.rheology.strain_mat.columns.shape[0] > 16 * self.delassus_operator.delassus_diagonal.shape[0]
+            )
+            if cooperative:
+                workers = min(color_launch_dim, max(1, 2 * average))
+                launch = wp.launch_tiled
+            else:
+                workers = max(64, ((2 * average + 63) // 64) * 64)
+            color_launch_dim = [workers] if cooperative else workers
+            launch_options = {"block_dim": 32}
+        else:
+            # Retain the previous mixed-row tuning outside the generated flow model.
+            if (
+                self.device.is_cuda
+                and self.rheology.has_viscosity
+                and self.rheology.has_dilatancy
+                and self.rheology.compliance_mat.nnz == 0
+                and self.rheology.strain_velocity_node_count == 8
+            ):
+                color_launch_dim = max(1, min(2048, self.rheology.color_blocks.shape[1]))
+                color_block_dim = 4
+                color_block_count = (color_launch_dim + color_block_dim - 1) // color_block_dim
+            workers = color_launch_dim
+            launch_options = {"block_dim": color_block_dim, "max_blocks": color_block_count}
         gs_kernel = make_gs_solve_kernel(
             has_viscosity=self.rheology.has_viscosity,
             has_dilatancy=self.rheology.has_dilatancy,
             has_compliance_mat=self.rheology.compliance_mat.nnz > 0,
             strain_velocity_node_count=self.rheology.strain_velocity_node_count,
+            use_cached_rows=use_cached_rows,
+            cooperative=cooperative,
         )
-        # Tune the existing GS kernel launch for its register-cached specialization.
-        if (
-            self.device.is_cuda
-            and self.rheology.has_viscosity
-            and self.rheology.has_dilatancy
-            and self.rheology.compliance_mat.nnz == 0
-            and self.rheology.strain_velocity_node_count == 8
-        ):
-            color_launch_dim = max(1, min(2048, self.rheology.color_blocks.shape[1]))
-            color_block_dim = 4
-            color_block_count = (color_launch_dim + color_block_dim - 1) // color_block_dim
-        self.solve_local_launch = wp.launch(
+        self.solve_local_launch = launch(
             kernel=gs_kernel,
             dim=color_launch_dim,
             inputs=[
                 0,  # color
-                color_launch_dim,
+                workers,
                 self.rheology.color_offsets,
                 self.rheology.color_blocks,
                 self.rheology.yield_params,
@@ -772,8 +800,7 @@ class _GaussSeidelSolver(_RheologySolver):
                 self.rheology.stress,
                 self.delta_stress,
             ],
-            block_dim=color_block_dim,
-            max_blocks=color_block_count,
+            **launch_options,
             record_cmd=True,
         )
 
